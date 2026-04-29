@@ -215,3 +215,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+ffmpeg.exe 
+ffprobe.exe 
+dist/ 
