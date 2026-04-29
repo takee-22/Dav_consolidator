@@ -1,4 +1,5 @@
 # DAV Consolidator – Python dependencies
 # Install with:  pip install -r requirements.txt
 
-PySide6>=6.6.0
+PyQt6>=6.6.0
+pyinstaller>=6.0.0

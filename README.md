@@ -1,261 +1,156 @@
-# DAV Consolidator
+# DAV Consolidator v2.0
 
-> Zero-frame-loss consolidation of IMOU camera `.dav` recordings into a
-> single `.mp4` file.  Built with Python 3.11+, PySide6, and FFmpeg.
-
----
-
-## Table of Contents
-
-1. [Prerequisites](#1-prerequisites)
-2. [Installation](#2-installation)
-3. [Running the Application](#3-running-the-application)
-4. [Building a Standalone .exe](#4-building-a-standalone-exe)
-5. [Project Structure](#5-project-structure)
-6. [How It Works — Technical Deep Dive](#6-how-it-works)
-7. [Verifying the Output](#7-verifying-the-output)
-8. [Troubleshooting](#8-troubleshooting)
+Merge and process IMOU `.dav` camera recordings into a single MP4 with
+**zero frame loss** — GPU-accelerated or CPU fallback, fully self-contained.
 
 ---
 
-## 1. Prerequisites
-
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| Python | 3.11+ | [python.org](https://www.python.org) |
-| PySide6 | 6.6+ | Installed via pip |
-| FFmpeg | 4.4+ (5.1+ recommended) | Must include `ffprobe` |
-
-### Installing FFmpeg on Windows
-
-**Option A — Winget (recommended)**
-```powershell
-winget install Gyan.FFmpeg
-```
-
-**Option B — Manual**
-1. Download a build from <https://www.gyan.dev/ffmpeg/builds/>
-2. Extract to `C:\ffmpeg`
-3. Add `C:\ffmpeg\bin` to your system `PATH`
-
-Verify:
-```powershell
-ffmpeg -version
-ffprobe -version
-```
-
----
-
-## 2. Installation
-
-```powershell
-# Clone / extract the project
-cd dav_consolidator
-
-# Create a virtual environment (recommended)
-python -m venv .venv
-.venv\Scripts\activate
-
-# Install Python dependencies
-pip install -r requirements.txt
-```
-
----
-
-## 3. Running the Application
-
-```powershell
-python main.py
-```
-
-### Workflow inside the GUI
-
-1. **Input Folder** — Click *Browse…* and select the folder containing your
-   `.dav` files.  The app will recursively find all `.dav` files and display
-   the count.
-
-2. **Output File** — Click *Browse…* and choose where to save the final
-   `.mp4`.
-
-3. **FFmpeg Path** — Leave as `ffmpeg` if it is on your system `PATH`.
-   Otherwise browse to the `ffmpeg.exe` binary directly.
-
-4. Click **▶ Start Conversion** and watch the log window for real-time
-   FFmpeg progress.
-
-5. On completion, a dialog shows the output path and the `ffprobe` command
-   to verify the duration.
-
----
-
-## 4. Building a Standalone .exe
-
-```powershell
-pip install pyinstaller
-
-# Build using the provided spec file
-pyinstaller dav_consolidator.spec
-```
-
-The executable is created at `dist\DAVConsolidator.exe`.
-
-> **Note:** The `.exe` bundles Python and PySide6 but **not** FFmpeg.
-> Distribute FFmpeg alongside the `.exe` or instruct end-users to install it
-> separately.  To bundle FFmpeg, add its binaries to the `binaries` list in
-> `dav_consolidator.spec`:
->
-> ```python
-> binaries=[("C:/ffmpeg/bin/ffmpeg.exe", "."),
->           ("C:/ffmpeg/bin/ffprobe.exe", ".")],
-> ```
-> Then in the GUI, set the FFmpeg path to `./ffmpeg.exe`.
-
----
-
-## 5. Project Structure
+## Project Structure
 
 ```
-dav_consolidator/
-│
-├── main.py                      # Entry point
+Dav_consolidator/
+├── main.py                  ← Entry point (dev + PyInstaller)
+├── requirements.txt
+├── build.bat                ← One-click PyInstaller build (Windows)
+├── ffmpeg.exe               ← Bundle here (NOT system-installed)
+├── ffprobe.exe              ← Bundle here (NOT system-installed)
 │
 ├── gui/
 │   ├── __init__.py
-│   └── main_window.py           # PySide6 MainWindow + ConversionWorker thread
+│   └── main_window.py       ← PyQt6 UI only — zero business logic
 │
-├── ffmpeg_wrapper/
+├── core/
 │   ├── __init__.py
-│   └── processor.py             # FFmpegProcessor: probe, transcode, concat
+│   └── processor.py         ← FFmpeg pipeline, probe, plan, transcode, concat
 │
-├── utils/
-│   ├── __init__.py
-│   └── file_utils.py            # Natural sort, file discovery, temp helpers
-│
-├── requirements.txt
-├── dav_consolidator.spec        # PyInstaller spec
-└── README.md
+└── utils/
+    ├── __init__.py
+    └── ffmpeg_utils.py      ← Binary resolution, file discovery, path helpers
 ```
 
 ---
 
-## 6. How It Works — Technical Deep Dive
+## Quick Start (Development)
 
-### The VFR Problem
+```bash
+pip install -r requirements.txt
 
-IMOU cameras record at **20 fps during the day** and **15 fps at night**.
-Naïvely forcing a single constant frame rate across all segments during
-concatenation would require the muxer to **duplicate frames** (when going
-from 15 → 20 fps) or **drop frames** (when going from 20 → 15 fps) at every
-day/night boundary.  Over a 12-segment, 60-minute recording this would
-introduce measurable drift.
-
-### Solution: VFR-Preserving Pipeline
-
-The pipeline has three steps:
-
-#### Step 1 — Per-Segment Transcode (VFR)
-
-```
-ffmpeg -i segment.dav \
-       -map 0:v? -map 0:a? \
-       -c:v libx264 -crf 18 -preset fast \
-       -fps_mode vfr \            ← key flag
-       -movflags +faststart \
-       -c:a aac -b:a 128k \
-       temp_0001.mp4
-```
-
-`-fps_mode vfr` (FFmpeg ≥ 5.1; `-vsync vfr` on older builds) tells the
-muxer: *write each frame with its original source timestamp — never
-duplicate or drop*.  The result is an MP4 whose duration exactly matches
-the source `.dav` segment.
-
-#### Step 2 — Concat Demuxer (Zero Re-Encode)
-
-A playlist `concat_list.txt` is written:
-
-```
-file '/path/to/0000.mp4'
-duration 300.000000
-file '/path/to/0001.mp4'
-duration 300.000000
-...
-```
-
-The `duration` directive is critical for the **last segment** — without it
-FFmpeg may under-report the total container duration by the duration of the
-final GOP.
-
-```
-ffmpeg -f concat -safe 0 -i concat_list.txt \
-       -c copy \                   ← bitstream copy, no re-encode
-       -movflags +faststart \
-       output.mp4
-```
-
-The concat demuxer offsets each segment's PTS by the cumulative duration of
-all preceding segments:
-
-```
-PTS_out(frame) = PTS_in(frame) + Σ(durations[0..i-1])
-```
-
-This guarantees:
-
-```
-output_duration == segment_0_duration + segment_1_duration + … + segment_N_duration
-```
-
-With no frame duplication or dropping at any segment boundary.
-
-#### Step 3 — Cleanup
-
-All intermediate `.mp4` files and `concat_list.txt` are deleted after a
-successful merge.
-
-### Why Not the `concat` Filter?
-
-The concat *filter* (`-filter_complex "[0:v][1:v]concat=n=2:v=1[out]"`)
-re-encodes the output and resamples all segments to a single common frame
-rate, which defeats the goal of zero frame loss.  The concat *demuxer* is a
-pure muxing operation — it never touches the encoded bitstream.
-
-### Natural Sort
-
-Files like `ch01_20240601120000.dav` … `ch01_20240601125500.dav` must be
-ordered chronologically.  The `natural_sorted()` utility splits filenames on
-digit boundaries and compares numeric substrings by value:
-
-```
-ch01_9.dav  < ch01_10.dav    (natural sort ✓)
-ch01_9.dav  > ch01_10.dav    (lexicographic sort ✗)
+# Place ffmpeg.exe + ffprobe.exe in the project root, then:
+python main.py
 ```
 
 ---
 
-## 7. Verifying the Output
+## PyInstaller Build (Windows)
 
-```powershell
-# Check total duration
-ffprobe -v error -show_entries format=duration \
-        -of default=noprint_wrappers=1 output.mp4
-
-# Full stream info
-ffprobe -v quiet -print_format json -show_streams output.mp4
+### Option A — batch script (recommended)
+```bat
+build.bat
 ```
 
-The reported duration should equal `N × 300.0` seconds (for N five-minute
-segments).  Differences of less than 1/fps (< 50 ms) are normal due to
-inter-frame timing; larger discrepancies indicate a source file problem.
+### Option B — manual command
+```bat
+pyinstaller ^
+    --onefile ^
+    --windowed ^
+    --name DAVConsolidator ^
+    --add-binary "ffmpeg.exe;." ^
+    --add-binary "ffprobe.exe;." ^
+    --hidden-import PyQt6.sip ^
+    --hidden-import PyQt6.QtCore ^
+    --hidden-import PyQt6.QtGui ^
+    --hidden-import PyQt6.QtWidgets ^
+    --collect-all PyQt6 ^
+    --clean ^
+    main.py
+```
+
+Output: `dist\DAVConsolidator.exe` — fully self-contained, no external
+dependencies needed on the target machine.
+
+### Flag reference
+
+| Flag | Purpose |
+|------|---------|
+| `--onefile` | Single `.exe` — everything packed inside |
+| `--windowed` | No console window on launch |
+| `--add-binary "ffmpeg.exe;."` | Bundle ffmpeg into the exe root (`sys._MEIPASS`) |
+| `--add-binary "ffprobe.exe;."` | Bundle ffprobe likewise |
+| `--hidden-import PyQt6.*` | Force PyQt6 modules that PyInstaller may miss |
+| `--collect-all PyQt6` | Include all Qt plugins (styles, image formats) |
+| `--clean` | Wipe previous build cache before starting |
 
 ---
 
-## 8. Troubleshooting
+## FFmpeg Binary Resolution
 
-| Symptom | Likely Cause | Fix |
-|---------|-------------|-----|
-| "FFmpeg not found" | Not on PATH | Set FFmpeg Path in GUI |
-| Segments out of order | Non-standard filename format | Rename files to include zero-padded sequence numbers |
-| Audio/video desync in output | Source `.dav` has corrupted timestamps | Re-probe with `ffprobe -v error -show_entries stream=duration_ts -i file.dav` |
-| Output shorter than expected | A segment failed to transcode | Check the log for `[ERROR]` lines; re-run with that segment isolated |
-| UPX compression error during build | UPX not installed | Remove `upx=True` from the spec or install UPX |
+`utils/ffmpeg_utils.py` resolves binaries in this priority order:
+
+1. **`sys._MEIPASS`** — PyInstaller one-file mode extracts bundled binaries here at runtime
+2. **Project root** — the directory containing `main.py` (development mode)
+3. **System PATH** — last-resort string fallback (`"ffmpeg"` / `"ffprobe"`)
+
+The same code path works transparently in both modes — no `#ifdef`-style branching.
+
+---
+
+## Processing Strategy
+
+After probing all source files, the engine automatically selects the
+optimal encoding plan:
+
+| Condition | Strategy | Speed |
+|-----------|----------|-------|
+| All segments: same codec + same resolution + codec is H.264/HEVC/VP8/VP9/AV1 | **Stream copy** — `-c copy`, zero re-encode | ⚡⚡⚡ Fastest |
+| GPU checkbox checked + NVIDIA NVENC available | **NVENC transcode** — `h264_nvenc -cq 18` | ⚡⚡ Fast |
+| Anything else | **CPU transcode** — `libx264 -crf 18 -preset fast` | ⚡ Universal |
+
+The selected plan is displayed in the UI before processing starts.
+
+### VFR / Frame-loss safety
+
+IMOU cameras produce 20 fps (day) and 15 fps (night) segments.
+`-fps_mode vfr` (FFmpeg ≥ 5.1) or `-vsync vfr` (older) is applied during
+transcoding to preserve each frame's original PTS — no frames are ever
+duplicated or dropped at VFR boundaries.
+
+---
+
+## Architecture Notes
+
+### Strict layer separation
+
+| Layer | Responsibility |
+|-------|---------------|
+| `gui/` | Render signals → UI updates only. Zero FFmpeg knowledge. |
+| `core/` | All subprocess calls, encoding decisions, cancel logic. |
+| `utils/` | Binary resolution, file discovery, natural sort, path helpers. |
+
+### Parallel probing
+
+`FFmpegProcessor.probe_all_parallel()` uses a `ThreadPoolExecutor` (4 workers
+by default) to probe all source files concurrently. On a folder with 48 segments
+this cuts probing time from ~48 s → ~12 s.
+
+### Thread-safety
+
+`FFmpegProcessor.cancel()` is safe to call from any thread. It sets a
+`threading.Event` and immediately `kill()`s the active subprocess via a lock-
+protected reference — the worker loop exits cleanly within milliseconds.
+
+### Logging
+
+All significant events are logged to both:
+- **Python `logging`** → stdout (visible in terminal / debug builds)
+- **GUI log pane** → colour-coded by severity via Qt signals
+
+---
+
+## Verifying Output Duration
+
+```bat
+ffprobe -v error -show_entries format=duration ^
+        -of default=noprint_wrappers=1 "output.mp4"
+```
+
+Expected: the sum of all source segment durations (within a few milliseconds).
