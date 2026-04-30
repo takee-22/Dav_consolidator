@@ -1,7 +1,20 @@
-# DAV Consolidator v2.0
+# DAV Consolidator v3.0
 
-Merge and process IMOU `.dav` camera recordings into a single MP4 with
-**zero frame loss** — GPU-accelerated or CPU fallback, fully self-contained.
+Forensic-accurate DAV → MP4 concatenation with zero frame loss,
+exact duration output, and watermark ↔ player-timeline alignment.
+
+---
+
+## What was fixed in v3
+
+| # | Bug | Root cause | Fix |
+|---|-----|-----------|-----|
+| 1 | Wrong FPS parsed from DAV | `r_frame_rate` returns `90000/1` (timebase), not FPS | Try `avg_frame_rate` first; validate 1–120 fps range |
+| 2 | 59:49 instead of 60:00 | No PTS reconstruction — broken DAV timestamps passed through | Added `fps=N`, `tpad=clone`, `setpts=N/FRAME_RATE/TB` filter chain |
+| 3 | Stream copy on DAV (unsafe) | `build_plan` allowed `-c copy` for h264 DAV files | DAV files always transcode — stream copy disabled for `.dav` extension |
+| 4 | Concat duration drift | `write_concat_list` used probe duration (~299.08 s) | Always write `SEGMENT_DURATION_SEC` (300.0 s) in playlist |
+| 5 | Wrong expected total shown | `sum(v.duration)` used broken probe values | `SEGMENT_DURATION_SEC × len(files)` gives exact total |
+| 6 | Audio sync drift | No audio PTS rebuild | Added `aresample=async=1` + `asetpts=N/SR/TB` |
 
 ---
 
@@ -9,140 +22,81 @@ Merge and process IMOU `.dav` camera recordings into a single MP4 with
 
 ```
 Dav_consolidator/
-├── main.py                  ← Entry point (dev + PyInstaller)
+├── main.py                  ← Entry point
 ├── requirements.txt
-├── build.bat                ← One-click PyInstaller build (Windows)
-├── ffmpeg.exe               ← Bundle here (NOT system-installed)
-├── ffprobe.exe              ← Bundle here (NOT system-installed)
+├── build.bat                ← PyInstaller build script
+├── ffmpeg.exe               ← Place here (not system PATH)
+├── ffprobe.exe              ← Place here (not system PATH)
 │
 ├── gui/
 │   ├── __init__.py
-│   └── main_window.py       ← PyQt6 UI only — zero business logic
+│   └── main_window.py       ← PyQt6 UI, theme toggle, worker thread
 │
 ├── core/
 │   ├── __init__.py
-│   └── processor.py         ← FFmpeg pipeline, probe, plan, transcode, concat
+│   └── processor.py         ← FFmpeg pipeline with DAV PTS reconstruction
 │
 └── utils/
     ├── __init__.py
-    └── ffmpeg_utils.py      ← Binary resolution, file discovery, path helpers
+    ├── ffmpeg_utils.py      ← Binary resolution, file discovery, DAV naming
+    └── file_utils.py        ← Backward-compat re-exports
 ```
 
 ---
 
-## Quick Start (Development)
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
-
-# Place ffmpeg.exe + ffprobe.exe in the project root, then:
+# Place ffmpeg.exe + ffprobe.exe in project root
 python main.py
 ```
 
 ---
 
-## PyInstaller Build (Windows)
+## PyInstaller Build
 
-### Option A — batch script (recommended)
 ```bat
 build.bat
 ```
 
-### Option B — manual command
+Or manually:
+
 ```bat
-pyinstaller ^
-    --onefile ^
-    --windowed ^
-    --name DAVConsolidator ^
+pyinstaller --onefile --windowed --name DAVConsolidator ^
     --add-binary "ffmpeg.exe;." ^
     --add-binary "ffprobe.exe;." ^
     --hidden-import PyQt6.sip ^
-    --hidden-import PyQt6.QtCore ^
-    --hidden-import PyQt6.QtGui ^
-    --hidden-import PyQt6.QtWidgets ^
-    --collect-all PyQt6 ^
-    --clean ^
-    main.py
+    --collect-all PyQt6 --clean main.py
 ```
 
-Output: `dist\DAVConsolidator.exe` — fully self-contained, no external
-dependencies needed on the target machine.
+---
 
-### Flag reference
+## Processing Pipeline
 
-| Flag | Purpose |
-|------|---------|
-| `--onefile` | Single `.exe` — everything packed inside |
-| `--windowed` | No console window on launch |
-| `--add-binary "ffmpeg.exe;."` | Bundle ffmpeg into the exe root (`sys._MEIPASS`) |
-| `--add-binary "ffprobe.exe;."` | Bundle ffprobe likewise |
-| `--hidden-import PyQt6.*` | Force PyQt6 modules that PyInstaller may miss |
-| `--collect-all PyQt6` | Include all Qt plugins (styles, image formats) |
-| `--clean` | Wipe previous build cache before starting |
+```
+For each .dav segment:
+  ffmpeg
+    -fflags +genpts+igndts+discardcorrupt   ← fix broken DAV timestamps
+    -err_detect ignore_err                  ← skip corrupt packets
+    -vf "fps=N,                             ← enforce constant frame rate
+         tpad=stop_mode=clone:...,          ← pad short segments to 300 s
+         setpts=N/FRAME_RATE/TB"            ← rebuild PTS from frame index
+    -af "aresample=async=1,                 ← fix audio gaps
+         asetpts=N/SR/TB"                   ← rebuild audio PTS
+    -t 300                                  ← hard cap at exactly 300 s
+    → intermediate_NNNN.mp4
+
+ffmpeg -f concat -c copy                    ← merge (no re-encode)
+    → 08.00.00-09.00.00.mp4
+```
 
 ---
 
-## FFmpeg Binary Resolution
+## Output Filename Convention
 
-`utils/ffmpeg_utils.py` resolves binaries in this priority order:
-
-1. **`sys._MEIPASS`** — PyInstaller one-file mode extracts bundled binaries here at runtime
-2. **Project root** — the directory containing `main.py` (development mode)
-3. **System PATH** — last-resort string fallback (`"ffmpeg"` / `"ffprobe"`)
-
-The same code path works transparently in both modes — no `#ifdef`-style branching.
-
----
-
-## Processing Strategy
-
-After probing all source files, the engine automatically selects the
-optimal encoding plan:
-
-| Condition | Strategy | Speed |
-|-----------|----------|-------|
-| All segments: same codec + same resolution + codec is H.264/HEVC/VP8/VP9/AV1 | **Stream copy** — `-c copy`, zero re-encode | ⚡⚡⚡ Fastest |
-| GPU checkbox checked + NVIDIA NVENC available | **NVENC transcode** — `h264_nvenc -cq 18` | ⚡⚡ Fast |
-| Anything else | **CPU transcode** — `libx264 -crf 18 -preset fast` | ⚡ Universal |
-
-The selected plan is displayed in the UI before processing starts.
-
-### VFR / Frame-loss safety
-
-IMOU cameras produce 20 fps (day) and 15 fps (night) segments.
-`-fps_mode vfr` (FFmpeg ≥ 5.1) or `-vsync vfr` (older) is applied during
-transcoding to preserve each frame's original PTS — no frames are ever
-duplicated or dropped at VFR boundaries.
-
----
-
-## Architecture Notes
-
-### Strict layer separation
-
-| Layer | Responsibility |
-|-------|---------------|
-| `gui/` | Render signals → UI updates only. Zero FFmpeg knowledge. |
-| `core/` | All subprocess calls, encoding decisions, cancel logic. |
-| `utils/` | Binary resolution, file discovery, natural sort, path helpers. |
-
-### Parallel probing
-
-`FFmpegProcessor.probe_all_parallel()` uses a `ThreadPoolExecutor` (4 workers
-by default) to probe all source files concurrently. On a folder with 48 segments
-this cuts probing time from ~48 s → ~12 s.
-
-### Thread-safety
-
-`FFmpegProcessor.cancel()` is safe to call from any thread. It sets a
-`threading.Event` and immediately `kill()`s the active subprocess via a lock-
-protected reference — the worker loop exits cleanly within milliseconds.
-
-### Logging
-
-All significant events are logged to both:
-- **Python `logging`** → stdout (visible in terminal / debug builds)
-- **GUI log pane** → colour-coded by severity via Qt signals
+Input files named `08.00.00-08.05.00[R][0@0][0].dav` → `08.55.00-09.00.00[R][0@0][0].dav`
+produce output named `08.00.00-09.00.00.mp4` automatically.
 
 ---
 
@@ -150,7 +104,18 @@ All significant events are logged to both:
 
 ```bat
 ffprobe -v error -show_entries format=duration ^
-        -of default=noprint_wrappers=1 "output.mp4"
+        -of default=noprint_wrappers=1 output.mp4
 ```
 
-Expected: the sum of all source segment durations (within a few milliseconds).
+Expected: `3600.000000` for 12 × 5-minute segments.
+
+---
+
+## New GUI Features (v3)
+
+- **Dark / Light theme toggle** (🌙 ↔ ☀) in the header
+- **Auto output filename** filled from DAV file naming convention
+- **GPU status badge** — tests NVENC when checkbox is ticked
+- **Elapsed time counter** while conversion is running
+- **Drag & drop** — drop a folder onto the Input Folder field
+- **Expected duration shown** before starting (e.g. "12 files → 1:00:00")

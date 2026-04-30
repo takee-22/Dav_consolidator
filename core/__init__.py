@@ -1,1 +1,1 @@
-"""core – FFmpeg processing pipeline (probe, plan, transcode, concat)."""
+"""core – FFmpeg processing pipeline."""

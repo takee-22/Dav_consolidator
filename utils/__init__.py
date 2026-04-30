@@ -1,1 +1,1 @@
-"""utils – File/path helpers and FFmpeg binary discovery."""
+"""utils – Binary resolution, file discovery, path helpers."""

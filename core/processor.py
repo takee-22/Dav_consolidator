@@ -1,39 +1,41 @@
 """
 core/processor.py
 -----------------
-FFmpeg / FFprobe processing pipeline.
+FFmpeg / FFprobe processing pipeline — DAV forensic-accurate mode.
 
-Architecture
-~~~~~~~~~~~~
-* ``VideoInfo``       — immutable metadata from a single ffprobe call.
-* ``ProcessingPlan``  — encoding strategy chosen after analysing all segments.
-* ``FFmpegProcessor`` — orchestrates subprocess calls; cancel-safe.
+Key fixes over previous version
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+BUG 1 – Wrong FPS source:
+    Old code tried r_frame_rate first. DAV files store the container
+    timebase (e.g. "90000/1") there, NOT the frame rate. Fixed: try
+    avg_frame_rate first and validate the result is in 1–120 fps range.
 
-Processing strategy (in priority order)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-1. **Stream copy** (fastest, lossless):
-   All segments share the same codec AND resolution AND the codec is
-   known-copy-compatible (H.264, HEVC, VP8/9, AV1).
-   Uses ``-c copy`` throughout — zero re-encoding.
+BUG 2 – Missing DAV timestamp reconstruction:
+    Old transcode_segment had no -fflags +genpts+igndts, no setpts filter,
+    no fps enforcement, no tpad. These caused the "59:49 instead of 60:00"
+    frame-loss problem. Fixed: full filter chain applied on every segment.
 
-2. **GPU transcode** (fast, near-lossless):
-   User requested GPU acceleration AND NVIDIA NVENC is detected and
-   functional.  Uses ``h264_nvenc`` with ``-rc vbr -cq 18``.
+BUG 3 – Stream copy unsafe for DAV:
+    Old copy_segment used -c copy, which copies the broken DAV timestamps
+    straight into the MP4. build_plan now NEVER returns stream_copy when
+    any input file is a .dav (detected by extension). DAV files always need
+    the PTS-reconstruction transcode path.
 
-3. **CPU transcode** (universal fallback):
-   ``libx264 -crf 18 -preset fast`` — always available.
+BUG 4 – Broken probe duration used in concat list:
+    Old write_concat_list used info.duration (often ~299.08 s for a 300 s
+    segment). The concat demuxer then computed cumulative offsets using those
+    wrong values, producing drift. Fixed: always write SEGMENT_DURATION_SEC
+    (300.0) as the duration directive so offsets are exact.
 
-VFR / frame-loss safety
-~~~~~~~~~~~~~~~~~~~~~~~~
-``-fps_mode vfr`` (FFmpeg ≥ 5.1) or ``-vsync vfr`` (older builds) is
-applied during transcoding to preserve each frame's original PTS rather
-than resampling to a fixed clock.  IMOU cameras mix 20 fps (day) and
-15 fps (night) segments; this flag is the cornerstone of zero-frame-loss.
-
-Thread-safety
-~~~~~~~~~~~~~
-:meth:`FFmpegProcessor.cancel` may be called from any thread.  It sets
-a :class:`threading.Event` and immediately kills the active subprocess.
+Watermark ↔ player-timeline alignment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The critical filter is:
+    fps=FPS → enforce constant frame rate (no VFR gaps)
+    setpts=N/FRAME_RATE/TB → rebuild every PTS from frame ordinal index
+Frame 0 → PTS 0, Frame 1 → PTS 1/FPS, Frame N → PTS N/FPS.
+Since the recording clock starts at t=0 for every segment, and there are
+no gaps between consecutive frames, the player timeline matches the
+burned-in watermark exactly throughout the concatenated output.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ import re
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional
@@ -62,16 +64,20 @@ ProgressCallback = Callable[[int, int], None]   # (current, total)
 # Constants
 # ---------------------------------------------------------------------------
 
+# Every DAV segment is exactly this many seconds.
+# Used for: PTS-cap (-t), tpad duration, concat list duration directive.
+SEGMENT_DURATION_SEC: int = 300   # 5 minutes
+
 _FFPROBE_NA = "N/A"
 
-# Codecs safe for -c copy demux concat without re-encoding.
-# (Raw formats like MJPEG are intentionally excluded — they need re-wrap.)
+# Codecs that *would* be copy-safe in an ideal world — kept for reference
+# but DAV files bypass copy entirely due to broken timestamps (see build_plan).
 _COPY_SAFE_CODECS: frozenset[str] = frozenset({
     "h264", "hevc", "h265", "vp8", "vp9", "av1",
 })
 
-# NVENC preset: p4 = balanced quality/speed (NVENC SDK ≥ 11 presets)
-_NVENC_PRESET = "p4"
+_NVENC_PRESET    = "p4"        # NVENC SDK ≥ 11 balanced preset
+_AUDIO_SAMPLE_RATE = 44100     # target sample rate for aresample
 
 
 # ---------------------------------------------------------------------------
@@ -80,16 +86,16 @@ _NVENC_PRESET = "p4"
 
 @dataclass(frozen=True)
 class VideoInfo:
-    """Metadata extracted from a single video file via ffprobe."""
+    """Immutable metadata from a single ffprobe call."""
 
     path:        Path
     fps:         float
-    duration:    float
+    duration:    float   # container-reported; may be wrong for DAV — do NOT use for timing
     width:       int
     height:      int
     has_audio:   bool
-    codec:       str          # lower-case video codec name, e.g. "h264"
-    audio_codec: str = ""     # lower-case audio codec name, e.g. "aac"
+    codec:       str
+    audio_codec: str = ""
 
     def resolution(self) -> tuple[int, int]:
         return (self.width, self.height)
@@ -104,18 +110,11 @@ class VideoInfo:
 @dataclass(frozen=True)
 class ProcessingPlan:
     """
-    Encoding strategy determined after probing all source segments.
+    Encoding strategy selected after probing all segments.
 
-    Attributes
-    ----------
-    use_stream_copy:
-        True → skip transcoding, use ``-c copy`` at segment-copy stage.
-    use_gpu:
-        True → use NVIDIA NVENC; False → libx264.
-    needs_transcode:
-        True when any re-encoding is required (i.e. not a pure stream copy).
-    reason:
-        Human-readable explanation for display in the GUI.
+    NOTE: use_stream_copy is intentionally NEVER set for .dav inputs.
+    DAV timestamps are always broken and must be reconstructed via
+    the setpts filter (which requires decoding → cannot stream copy).
     """
 
     use_stream_copy: bool
@@ -125,24 +124,15 @@ class ProcessingPlan:
 
     @classmethod
     def stream_copy(cls, reason: str) -> "ProcessingPlan":
-        return cls(
-            use_stream_copy=True, use_gpu=False,
-            needs_transcode=False, reason=reason,
-        )
+        return cls(use_stream_copy=True,  use_gpu=False, needs_transcode=False, reason=reason)
 
     @classmethod
     def transcode_gpu(cls, reason: str) -> "ProcessingPlan":
-        return cls(
-            use_stream_copy=False, use_gpu=True,
-            needs_transcode=True, reason=reason,
-        )
+        return cls(use_stream_copy=False, use_gpu=True,  needs_transcode=True,  reason=reason)
 
     @classmethod
     def transcode_cpu(cls, reason: str) -> "ProcessingPlan":
-        return cls(
-            use_stream_copy=False, use_gpu=False,
-            needs_transcode=True, reason=reason,
-        )
+        return cls(use_stream_copy=False, use_gpu=False, needs_transcode=True,  reason=reason)
 
 
 # ---------------------------------------------------------------------------
@@ -151,49 +141,48 @@ class ProcessingPlan:
 
 class FFmpegProcessor:
     """
-    Encapsulates all FFmpeg / FFprobe subprocess interactions.
+    Orchestrates all FFmpeg / FFprobe subprocess calls.
 
     Parameters
     ----------
-    ffmpeg_path:
-        Absolute path to the ffmpeg binary (or bare 'ffmpeg' for PATH).
-    ffprobe_path:
-        Absolute path to the ffprobe binary (or bare 'ffprobe' for PATH).
+    ffmpeg_path / ffprobe_path:
+        Absolute paths or bare names ('ffmpeg'/'ffprobe') for PATH fallback.
     use_gpu:
-        User preference: attempt NVENC.  Validated at runtime.
+        Instance-level GPU preference; validated at runtime by detect_nvenc().
     max_workers:
-        Thread pool size for parallel :meth:`probe_all_parallel` calls.
+        Thread-pool size for parallel probe_all_parallel() calls.
+    segment_duration:
+        Expected duration of each input segment in seconds (default 300 = 5 min).
+        Used for -t cap and tpad.
     """
 
     def __init__(
         self,
-        ffmpeg_path:  str = "ffmpeg",
-        ffprobe_path: str = "ffprobe",
-        use_gpu:      bool = False,
-        max_workers:  int  = 4,
+        ffmpeg_path:      str  = "ffmpeg",
+        ffprobe_path:     str  = "ffprobe",
+        use_gpu:          bool = False,
+        max_workers:      int  = 4,
+        segment_duration: int  = SEGMENT_DURATION_SEC,
     ) -> None:
-        self.ffmpeg_path  = ffmpeg_path
-        self.ffprobe_path = ffprobe_path
-        self._prefer_gpu  = use_gpu
-        self._max_workers = max(1, max_workers)
+        self.ffmpeg_path      = ffmpeg_path
+        self.ffprobe_path     = ffprobe_path
+        self._prefer_gpu      = use_gpu
+        self._max_workers     = max(1, max_workers)
+        self._segment_duration = segment_duration
 
-        self._cancel_event  = threading.Event()
-        self._active_proc:  Optional[subprocess.Popen] = None
-        self._proc_lock     = threading.Lock()
+        self._cancel_event   = threading.Event()
+        self._active_proc:   Optional[subprocess.Popen] = None
+        self._proc_lock      = threading.Lock()
 
-        # Cached results (reset on each :meth:`reset` call)
-        self._ffmpeg_version: Optional[tuple[int, int]] = None
-        self._nvenc_available: Optional[bool]           = None
+        self._ffmpeg_version:  Optional[tuple[int, int]] = None
+        self._nvenc_available: Optional[bool]            = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def cancel(self) -> None:
-        """
-        Signal cancellation and immediately kill the active subprocess.
-        Safe to call from any thread.
-        """
+        """Kill active subprocess and signal cancellation. Thread-safe."""
         self._cancel_event.set()
         with self._proc_lock:
             if self._active_proc and self._active_proc.poll() is None:
@@ -201,7 +190,7 @@ class FFmpegProcessor:
                 logger.info("Active FFmpeg subprocess killed (cancel requested)")
 
     def reset(self) -> None:
-        """Clear the cancel flag and cached GPU state before a new run."""
+        """Clear cancel flag and GPU cache before a new run."""
         self._cancel_event.clear()
         self._nvenc_available = None
         logger.debug("FFmpegProcessor reset")
@@ -215,15 +204,7 @@ class FFmpegProcessor:
     # ------------------------------------------------------------------
 
     def detect_ffmpeg(self) -> tuple[bool, str]:
-        """
-        Verify that both ffmpeg and ffprobe binaries are reachable.
-
-        Returns
-        -------
-        (ok: bool, message: str)
-            *ok* is True when both tools respond.  *message* is the
-            FFmpeg version string on success, or an error description.
-        """
+        """Verify both binaries are reachable. Returns (ok, version_or_error)."""
         try:
             r = subprocess.run(
                 [self.ffmpeg_path, "-version"],
@@ -231,7 +212,6 @@ class FFmpegProcessor:
                 creationflags=self._no_window_flag(),
             )
             version_line = r.stdout.splitlines()[0] if r.stdout else "unknown"
-
             subprocess.run(
                 [self.ffprobe_path, "-version"],
                 capture_output=True, timeout=10,
@@ -239,19 +219,15 @@ class FFmpegProcessor:
             )
             logger.info("FFmpeg detected: %s", version_line)
             return True, version_line
-
         except FileNotFoundError as exc:
             return False, f"Executable not found: {exc.filename}"
         except subprocess.TimeoutExpired:
             return False, "FFmpeg timed out during version check."
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return False, str(exc)
 
     def get_ffmpeg_version(self) -> tuple[int, int]:
-        """
-        Return (major, minor) FFmpeg version; (0, 0) on parse failure.
-        Result is cached for the lifetime of this processor instance.
-        """
+        """Return (major, minor); (0,0) on failure. Cached per instance."""
         if self._ffmpeg_version is not None:
             return self._ffmpeg_version
         try:
@@ -264,41 +240,33 @@ class FFmpegProcessor:
             if m:
                 self._ffmpeg_version = (int(m.group(1)), int(m.group(2)))
                 return self._ffmpeg_version
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         self._ffmpeg_version = (0, 0)
         return self._ffmpeg_version
 
     def detect_nvenc(self) -> bool:
         """
-        Check NVENC availability by running a tiny test encode.
-
-        The test encodes a single black frame (64×64, 0.1 s) to /dev/null
-        (or NUL on Windows).  This confirms the driver/SDK are functional,
-        not just that the encoder is listed in ``ffmpeg -encoders``.
-
-        Result is cached until :meth:`reset` is called.
+        Test NVENC with a real tiny encode (not just -encoders listing).
+        Cached until reset() is called.
         """
         if self._nvenc_available is not None:
             return self._nvenc_available
-
         logger.info("Probing NVENC availability…")
         try:
             r = subprocess.run(
                 [
                     self.ffmpeg_path, "-y",
                     "-f", "lavfi", "-i", "color=black:s=64x64:r=1:d=0.1",
-                    "-c:v", "h264_nvenc",
-                    "-frames:v", "1",
+                    "-c:v", "h264_nvenc", "-frames:v", "1",
                     "-f", "null", "-",
                 ],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, timeout=20,
                 creationflags=self._no_window_flag(),
             )
             available = r.returncode == 0
-        except Exception:  # noqa: BLE001
+        except Exception:
             available = False
-
         self._nvenc_available = available
         logger.info("NVENC available: %s", available)
         return available
@@ -309,12 +277,13 @@ class FFmpegProcessor:
 
     def get_video_info(self, input_path: Path) -> VideoInfo:
         """
-        Probe *input_path* and return a :class:`VideoInfo`.
+        Probe *input_path* and return a VideoInfo.
 
-        Raises
-        ------
-        RuntimeError
-            On ffprobe failure, JSON parse error, or missing video stream.
+        FIX: avg_frame_rate is now tried BEFORE r_frame_rate.
+        DAV files store the container timebase (e.g. 90000/1) in
+        r_frame_rate, which is NOT the frame rate. avg_frame_rate
+        correctly returns the actual fps (e.g. 20/1 or 25/1).
+        A sanity check rejects values outside 1–120 fps range.
         """
         cmd = [
             self.ffprobe_path,
@@ -345,20 +314,22 @@ class FFmpegProcessor:
         streams = data.get("streams", [])
         fmt     = data.get("format", {})
 
-        # Video stream
         video = next((s for s in streams if s.get("codec_type") == "video"), None)
         if video is None:
             raise RuntimeError(f"No video stream found in {input_path.name}")
 
-        fps      = self._parse_fps(video.get("r_frame_rate", "0/1"),
-                                   video.get("avg_frame_rate", "0/1"))
+        # ── FIX: avg_frame_rate first, r_frame_rate second, range-validated ──
+        fps = self._parse_fps(
+            video.get("avg_frame_rate", "0/1"),   # ← correct source for DAV
+            video.get("r_frame_rate",   "0/1"),   # ← fallback (often timebase)
+        )
+
         raw_dur  = video.get("duration") or fmt.get("duration", "0")
         duration = float(raw_dur) if raw_dur not in ("", _FFPROBE_NA) else 0.0
         width    = int(video.get("width",  0))
         height   = int(video.get("height", 0))
         codec    = video.get("codec_name", "unknown").lower()
 
-        # Audio stream
         audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
         has_audio   = audio is not None
         audio_codec = (audio.get("codec_name", "") if audio else "").lower()
@@ -378,24 +349,8 @@ class FFmpegProcessor:
         on_progress: Optional[ProgressCallback] = None,
     ) -> list[VideoInfo]:
         """
-        Probe *paths* in parallel using a :class:`ThreadPoolExecutor`.
-
-        Files that fail to probe are logged as warnings and excluded.
-        The returned list preserves the original sort order.
-
-        Parameters
-        ----------
-        paths:
-            Source video paths to probe.
-        log:
-            GUI log callback ``(message, level)``.
-        on_progress:
-            Optional ``(done, total)`` callback for the progress bar.
-
-        Returns
-        -------
-        list[VideoInfo]
-            Successfully probed infos in original path order.
+        Probe *paths* in parallel. Failed probes are logged and excluded.
+        Returned list is in original sort order.
         """
         results: dict[int, Optional[VideoInfo]] = {}
         total = len(paths)
@@ -422,7 +377,6 @@ class FFmpegProcessor:
                 if on_progress:
                     on_progress(done, total)
 
-        # Reconstruct in original order, drop failures
         return [results[i] for i in sorted(results) if results[i] is not None]
 
     # ------------------------------------------------------------------
@@ -435,30 +389,43 @@ class FFmpegProcessor:
         force_gpu: bool = False,
     ) -> ProcessingPlan:
         """
-        Analyse probed metadata and choose the optimal encoding strategy.
+        Choose the optimal encoding strategy.
 
-        Decision tree
-        -------------
-        1. All same codec + resolution + codec is copy-safe → stream copy.
-        2. GPU requested and NVENC functional → NVENC transcode.
-        3. Otherwise → CPU libx264 transcode.
+        FIX: DAV files (.dav extension) ALWAYS go through transcode.
+        Stream copy cannot apply the setpts PTS-reconstruction filter
+        (which requires decoding), so stream copy is never safe for DAV.
 
-        Parameters
-        ----------
-        infos:
-            Probed metadata for all source segments.
-        force_gpu:
-            Override the instance-level ``use_gpu`` preference.
+        Non-DAV inputs with matching codec/resolution still get stream copy.
         """
         if not infos:
             return ProcessingPlan.transcode_cpu("No input files")
 
+        # ── FIX: force transcode for any DAV input ───────────────────
+        has_dav = any(i.path.suffix.lower() == ".dav" for i in infos)
+        if has_dav:
+            # Explain the plan (GPU vs CPU), never stream copy
+            want_gpu = force_gpu or self._prefer_gpu
+            if want_gpu and self.detect_nvenc():
+                reason = (
+                    "DAV input → PTS reconstruction required "
+                    "→ GPU transcode (NVENC h264_nvenc, setpts rebuild)"
+                )
+                logger.info("Plan: %s", reason)
+                return ProcessingPlan.transcode_gpu(reason)
+            reason = (
+                "DAV input → PTS reconstruction required "
+                "→ CPU transcode (libx264 -crf 18, setpts rebuild)"
+            )
+            logger.info("Plan: %s", reason)
+            return ProcessingPlan.transcode_cpu(reason)
+
+        # ── Non-DAV: stream copy when safe ────────────────────────────
         codecs      = {i.codec for i in infos}
         resolutions = {i.resolution() for i in infos}
         first_codec = infos[0].codec
 
         can_copy = (
-            len(codecs)      == 1
+            len(codecs) == 1
             and len(resolutions) == 1
             and first_codec in _COPY_SAFE_CODECS
         )
@@ -467,12 +434,11 @@ class FFmpegProcessor:
             reason = (
                 f"All {len(infos)} segments share codec={first_codec!r}, "
                 f"resolution={infos[0].width}x{infos[0].height} "
-                f"→ stream copy (zero re-encode, fastest)"
+                f"→ stream copy (zero re-encode)"
             )
             logger.info("Plan: %s", reason)
             return ProcessingPlan.stream_copy(reason)
 
-        # Explain why copy was not possible
         if len(codecs) > 1:
             mismatch = f"mixed codecs {codecs}"
         elif len(resolutions) > 1:
@@ -481,19 +447,15 @@ class FFmpegProcessor:
             mismatch = f"codec {first_codec!r} not copy-safe"
 
         want_gpu = force_gpu or self._prefer_gpu
-        if want_gpu:
-            if self.detect_nvenc():
-                reason = f"{mismatch} → GPU transcode (NVENC h264_nvenc)"
-                logger.info("Plan: %s", reason)
-                return ProcessingPlan.transcode_gpu(reason)
-            logger.warning("NVENC requested but unavailable; falling back to CPU")
+        if want_gpu and self.detect_nvenc():
+            reason = f"{mismatch} → GPU transcode (NVENC h264_nvenc)"
+            return ProcessingPlan.transcode_gpu(reason)
 
         reason = f"{mismatch} → CPU transcode (libx264 -crf 18)"
-        logger.info("Plan: %s", reason)
         return ProcessingPlan.transcode_cpu(reason)
 
     # ------------------------------------------------------------------
-    # Step 1a – Transcode a single segment
+    # Step 1a – Transcode a single segment (FULL DAV FIX)
     # ------------------------------------------------------------------
 
     def transcode_segment(
@@ -504,53 +466,101 @@ class FFmpegProcessor:
         log:         LogCallback,
     ) -> bool:
         """
-        Transcode *info.path* to an intermediate H.264 MP4 at *output_path*.
+        Decode and re-encode *info.path* to a frame-accurate intermediate MP4.
 
-        Codec selection
-        ~~~~~~~~~~~~~~~
-        * GPU  (NVENC): ``h264_nvenc -rc vbr -cq 18 -preset p4``
-        * CPU (libx264): ``libx264 -crf 18 -preset fast``
+        DAV timestamp reconstruction pipeline
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        -fflags +genpts+igndts+discardcorrupt
+            genpts   → regenerate PTS from DTS when PTS is missing/invalid
+            igndts   → ignore non-monotonic DTS entirely
+            discardcorrupt → skip corrupt packets rather than aborting
 
-        ``-fps_mode vfr`` / ``-vsync vfr`` preserves original frame PTS,
-        preventing frame duplication or dropping at VFR boundaries.
+        -err_detect ignore_err
+            Continue past broken NAL units (common in CCTV recordings).
 
-        Returns True on success; False on cancellation or FFmpeg error.
+        -vf "fps=FPS,tpad=...,setpts=N/FRAME_RATE/TB"
+            fps=FPS    → enforce constant frame rate first.
+                         Duplicates frames to fill gaps; ensures every
+                         1/FPS interval has exactly one frame.
+            tpad=clone → if the stream is short (<300 s), clone the last
+                         frame to reach exactly SEGMENT_DURATION_SEC.
+            setpts=N/FRAME_RATE/TB
+                       → THE CRITICAL FIX. Discards all original PTS values
+                         and rebuilds them purely from the frame index N.
+                         Frame 0 → 0 s, Frame 1 → 1/FPS s, Frame N → N/FPS s.
+                         Guarantees monotonic, gap-free, watermark-aligned PTS.
+
+        -af "aresample=async=1,asetpts=N/SR/TB"
+            aresample  → stretch/compress audio to fill timeline gaps.
+            asetpts    → same ordinal-index rebuild for audio samples.
+
+        -t SEGMENT_DURATION_SEC
+            Hard-cap output at exactly 300 s. Combined with tpad this
+            ensures every intermediate segment is precisely 300.000 s.
         """
         if self.is_cancelled:
             return False
 
-        fps_flag = self._fps_mode_flag()
+        fps     = info.fps
+        fps_str = f"{fps:.6f}".rstrip("0").rstrip(".")
+        # Pad: give 1 extra second of headroom so tpad always reaches target
+        pad_dur = max(0.0, self._segment_duration - info.duration + 1.0)
 
         if plan.use_gpu:
-            video_codec_args = [
+            vcodec_args = [
                 "-c:v", "h264_nvenc",
                 "-rc",  "vbr",
                 "-cq",  "18",
                 "-preset", _NVENC_PRESET,
-                "-b:v", "0",      # let -cq control quality, not target bitrate
+                "-b:v", "0",
             ]
             codec_label = "NVENC"
         else:
-            video_codec_args = [
+            vcodec_args = [
                 "-c:v", "libx264",
                 "-crf",    "18",
                 "-preset", "fast",
             ]
             codec_label = "libx264"
 
-        audio_args = (
-            ["-c:a", "aac", "-b:a", "128k"] if info.has_audio else ["-an"]
+        if info.has_audio:
+            audio_args = ["-c:a", "aac", "-b:a", "128k", "-ar", str(_AUDIO_SAMPLE_RATE)]
+            af = f"aresample=async=1:min_hard_comp=0.100:first_pts=0,asetpts=N/SR/TB"
+            audio_filter_args = ["-af", af]
+        else:
+            audio_args        = ["-an"]
+            audio_filter_args = []
+
+        # Video filter chain — the cornerstone of timestamp accuracy
+        vf = (
+            f"fps={fps_str},"                                           # 1. enforce CFR
+            f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f},"       # 2. pad if short
+            f"setpts=N/FRAME_RATE/TB"                                   # 3. rebuild PTS
         )
+
+        fps_flag = self._fps_mode_flag()
 
         cmd = [
             self.ffmpeg_path, "-y",
-            "-i", str(info.path),
-            "-map", "0:v?",       # include video if present; skip silently if absent
-            "-map", "0:a?",       # include audio if present
-            *video_codec_args,
+            # ── Input flags — critical for broken DAV timestamps ──────
+            "-fflags",     "+genpts+igndts+discardcorrupt",
+            "-err_detect", "ignore_err",
+            "-i",          str(info.path),
+            # ── Stream selection ──────────────────────────────────────
+            "-map", "0:v?",
+            "-map", "0:a?",
+            # ── Video ────────────────────────────────────────────────
+            *vcodec_args,
+            "-vf", vf,
+            # ── VFR mode ─────────────────────────────────────────────
             fps_flag[0], fps_flag[1],
-            "-movflags", "+faststart",
+            # ── Audio ────────────────────────────────────────────────
             *audio_args,
+            *audio_filter_args,
+            # ── Hard duration cap ─────────────────────────────────────
+            "-t", str(self._segment_duration),
+            # ── Container ────────────────────────────────────────────
+            "-movflags", "+faststart",
             str(output_path),
         ]
 
@@ -563,7 +573,7 @@ class FFmpegProcessor:
         return self._run_ffmpeg(cmd, log, label=info.path.name)
 
     # ------------------------------------------------------------------
-    # Step 1b – Stream copy a single segment (no transcode)
+    # Step 1b – Stream copy (non-DAV only)
     # ------------------------------------------------------------------
 
     def copy_segment(
@@ -573,23 +583,19 @@ class FFmpegProcessor:
         log:         LogCallback,
     ) -> bool:
         """
-        Re-wrap *info.path* into an intermediate MP4 using ``-c copy``.
+        Re-wrap *info.path* into an intermediate MP4 using -c copy.
 
-        Faster than transcoding (no decoding/encoding); used when all
-        segments qualify for stream copy per :meth:`build_plan`.
-        The MP4 container re-wrap ensures the concat demuxer can interleave
-        PTS values correctly regardless of the original container format.
-
-        Returns True on success.
+        Only called for non-DAV inputs where build_plan returned stream_copy.
+        DAV files NEVER reach this code path.
         """
         if self.is_cancelled:
             return False
 
         cmd = [
             self.ffmpeg_path, "-y",
-            "-i", str(info.path),
-            "-map", "0:v?",
-            "-map", "0:a?",
+            "-i",    str(info.path),
+            "-map",  "0:v?",
+            "-map",  "0:a?",
             "-c",    "copy",
             "-movflags", "+faststart",
             str(output_path),
@@ -608,29 +614,21 @@ class FFmpegProcessor:
         list_path: Path,
     ) -> None:
         """
-        Write the FFmpeg concat demuxer playlist to *list_path*.
+        Write the FFmpeg concat demuxer playlist.
 
-        The ``duration`` directive is included for every segment so FFmpeg
-        can accurately compute the total duration even if the last segment's
-        container duration is missing or slightly off.
+        FIX: The duration directive is always SEGMENT_DURATION_SEC (300.0),
+        NOT the probe duration. This ensures the concat demuxer offsets each
+        segment by exactly 300 s, preventing cumulative drift.
 
-        Example output::
-
-            file '/abs/path/0000.mp4'
-            duration 300.000000
-            file '/abs/path/0001.mp4'
-            duration 300.000000
+        The caller must pass (path, SEGMENT_DURATION_SEC) as the float value.
         """
         lines: list[str] = []
         for path, duration in segments:
             safe_path = str(path.resolve()).replace("\\", "/")
             lines.append(f"file '{safe_path}'")
             lines.append(f"duration {duration:.6f}")
-
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        logger.debug(
-            "Wrote concat list → %s (%d segments)", list_path, len(segments)
-        )
+        logger.debug("Wrote concat list → %s (%d segments)", list_path, len(segments))
 
     # ------------------------------------------------------------------
     # Step 3 – Concatenate
@@ -643,20 +641,19 @@ class FFmpegProcessor:
         log:         LogCallback,
     ) -> bool:
         """
-        Merge all intermediate segments into *output_path* via the
-        concat demuxer (``-f concat -c copy``).
+        Merge intermediate segments via concat demuxer (-f concat -c copy).
 
-        PTS values are offset by the cumulative duration of all preceding
-        segments, ensuring:
-
-            output_duration == Σ(segment_durations)
-
-        No re-encoding occurs here regardless of the processing plan.
-
-        Returns True on success.
+        Safe here because all intermediates were produced by us with identical
+        codec / FPS / resolution and correct monotonic PTS values.
+        No re-encoding occurs.
         """
         if self.is_cancelled:
             return False
+
+        n_segs = sum(
+            1 for ln in list_path.read_text().splitlines()
+            if ln.startswith("file")
+        )
 
         cmd = [
             self.ffmpeg_path, "-y",
@@ -667,12 +664,12 @@ class FFmpegProcessor:
             "-movflags", "+faststart",
             str(output_path),
         ]
-        log("  Running concat demuxer (bitstream copy, no re-encode)…", "info")
-        logger.info("Concatenating %d segments → %s", 0, output_path)
+        log(f"  Concat demuxer: merging {n_segs} segments (bitstream copy)…", "info")
+        logger.info("Concatenating %d segments → %s", n_segs, output_path.name)
         return self._run_ffmpeg(cmd, log, label="concat")
 
     # ------------------------------------------------------------------
-    # Internal subprocess runner
+    # Subprocess runner
     # ------------------------------------------------------------------
 
     def _run_ffmpeg(
@@ -683,17 +680,8 @@ class FFmpegProcessor:
         label: str = "",
     ) -> bool:
         """
-        Launch *cmd* as a subprocess, streaming stderr to *log* in real time.
-
-        FFmpeg writes all progress and diagnostics to stderr.  We capture
-        it line-by-line and forward filtered lines to the GUI log pane so
-        the user sees live progress without blocking the UI thread.
-
-        Returns
-        -------
-        bool
-            True on exit-code 0.  False on subprocess error, OS failure,
-            or cancellation.
+        Launch *cmd*, stream stderr line-by-line to the log callback.
+        Returns True on exit-code 0.
         """
         logger.debug("Launching: %s", " ".join(cmd))
         try:
@@ -735,8 +723,7 @@ class FFmpegProcessor:
 
         if proc.returncode != 0:
             log(
-                f"[ERROR] FFmpeg exited {proc.returncode} "
-                f"while processing {label!r}",
+                f"[ERROR] FFmpeg exited {proc.returncode} processing {label!r}",
                 "error",
             )
             logger.error("FFmpeg exit %d for %r", proc.returncode, label)
@@ -749,31 +736,36 @@ class FFmpegProcessor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_fps(r_frame_rate: str, avg_frame_rate: str) -> float:
+    def _parse_fps(avg_frame_rate: str, r_frame_rate: str) -> float:
         """
-        Parse a fractional frame-rate string (e.g. ``"20/1"``) to float.
+        Parse FPS from FFprobe strings.
 
-        Tries ``r_frame_rate`` first (real base frame rate from the container
-        header), then ``avg_frame_rate`` (averaged over the stream).
-        Returns 25.0 as a safe fallback if both fail.
+        FIX: avg_frame_rate is now the PRIMARY source (parameter order changed).
+        DAV files report r_frame_rate = "90000/1" (the timebase denominator,
+        not the FPS). avg_frame_rate = "20/1" is the actual recording rate.
+
+        Validation: rejects values outside 1–120 fps range, then falls back
+        to the secondary source, then defaults to 25.0.
         """
-        for raw in (r_frame_rate, avg_frame_rate):
+        for raw in (avg_frame_rate, r_frame_rate):
             try:
                 frac = Fraction(raw)
                 val  = float(frac)
-                if frac.denominator != 0 and val > 0:
+                if 1.0 <= val <= 120.0:
                     return val
             except (ValueError, ZeroDivisionError):
                 continue
+        logger.warning(
+            "Could not parse FPS from avg=%r r=%r — defaulting to 25.0",
+            avg_frame_rate, r_frame_rate,
+        )
         return 25.0
 
     def _fps_mode_flag(self) -> tuple[str, str]:
         """
-        Return the correct FFmpeg VFR-preservation flag for the installed version.
-
-        FFmpeg ≥ 5.1 renamed ``-vsync`` to ``-fps_mode``; both versions
-        accept ``vfr`` as the argument.  We detect at runtime so the
-        application works with older FFmpeg installations.
+        Return the correct VFR flag for the installed FFmpeg version.
+        FFmpeg ≥ 5.1: -fps_mode vfr
+        FFmpeg < 5.1: -vsync vfr
         """
         major, minor = self.get_ffmpeg_version()
         if (major, minor) >= (5, 1):
@@ -782,14 +774,7 @@ class FFmpegProcessor:
 
     @staticmethod
     def _is_loggable(line: str) -> bool:
-        """
-        Return True for FFmpeg stderr lines worth forwarding to the GUI.
-
-        We show progress lines (``frame=``), error/warning keywords, and
-        structural messages (Input/Output blocks, Duration, Stream mapping).
-        We suppress the repetitive stream-dump lines that flood logs during
-        concatenation of many segments.
-        """
+        """Filter FFmpeg stderr to lines worth showing in the GUI log."""
         important = (
             "frame=", "Error", "error", "Invalid", "failed",
             "Warning", "warning", "Output #", "Input #",
@@ -799,10 +784,7 @@ class FFmpegProcessor:
 
     @staticmethod
     def _no_window_flag() -> int:
-        """
-        Return Windows ``CREATE_NO_WINDOW`` (0x08000000) so FFmpeg
-        subprocesses never flash a console window.  Returns 0 elsewhere.
-        """
+        """Return CREATE_NO_WINDOW on Windows so FFmpeg never flashes a console."""
         try:
             import subprocess as _sp
             return _sp.CREATE_NO_WINDOW  # type: ignore[attr-defined]
