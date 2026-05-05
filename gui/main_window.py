@@ -1,1098 +1,889 @@
 """
 gui/main_window.py
 ------------------
-PyQt6 main window for DAV Consolidator v3.
+DAV Consolidator v4 — Minimalist PyQt6 interface.
 
-Fixes applied in this version
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-BUG 5 – Wrong expected duration displayed/used:
-    Old code used sum(v.duration for v in video_infos) — the broken probe
-    values from DAV files. Fixed: SEGMENT_DURATION_SEC * len(infos) gives
-    the correct expected total (e.g. 12 × 300 = 3600 s exactly).
-
-BUG 6 – Wrong duration in concat list:
-    Old code passed info.duration (probe value ≈ 299.08 s) to write_concat_list.
-    Fixed: always pass float(SEGMENT_DURATION_SEC) = 300.0 so the concat
-    demuxer offsets each segment by exactly 300 s, eliminating drift.
-
-New features
-~~~~~~~~~~~~
-• Dark ↔ Light theme toggle (🌙 / ☀) in the header
-• Auto output filename derived from DAV naming convention
-  (first file start time → last file end time → e.g. 08.00.00-09.00.00.mp4)
-• GPU status badge that shows detected / not detected
-• Elapsed time counter in the status bar
-• Drag-and-drop folder support on the input field
-• Improved colour-coded log with horizontal rule dividers
+Design principles
+~~~~~~~~~~~~~~~~~
+• Expose ONLY what the spec requires: file list, output path,
+  re-encoding toggle, target FPS (conditional), start/cancel.
+• FFmpeg binary path is fully hidden — users never see it.
+• Dark ↔ Light theme toggle in the top-right corner.
+• GPU status badge auto-detects all three hardware accelerators.
+• ToggleSwitch is a custom pill-style QWidget (no third-party deps).
+• ConversionWorker (QThread) keeps the GUI fully responsive.
 """
-
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import timedelta
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QThread, QTimer, Qt,
-    pyqtSignal, pyqtSlot,
+    QEasingCurve, QPoint, QPropertyAnimation,
+    QSize, Qt, QThread, QTimer,
+    pyqtProperty, pyqtSignal, pyqtSlot,
 )
 from PyQt6.QtGui import (
-    QColor, QFont, QTextCharFormat, QTextCursor,
-    QDragEnterEvent, QDropEvent,
+    QColor, QDragEnterEvent, QDropEvent,
+    QFont, QPainter, QPen, QTextCharFormat, QTextCursor,
 )
 from PyQt6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QFileDialog,
-    QFrame,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
-    QSizePolicy,
-    QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QApplication, QDoubleSpinBox,
+    QFileDialog, QFrame, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QSizePolicy,
+    QSpacerItem, QVBoxLayout, QWidget,
 )
 
-from core.processor import FFmpegProcessor, ProcessingPlan, SEGMENT_DURATION_SEC
-from utils.ffmpeg_utils import (
-    build_output_filename,
-    cleanup_files,
-    derive_ffprobe_from_ffmpeg,
-    ensure_mp4_extension,
-    find_dav_files,
-    get_ffmpeg_path,
-    get_ffprobe_path,
-    make_temp_dir,
-)
+from core.gpu_detector import GPUInfo, detect_best, detect_all, Accelerator
+from core.processor import Processor, ClipInfo, SEGMENT_DURATION
+from utils.ffmpeg_utils import get_ffmpeg, natural_sorted
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Theme definitions
-# ---------------------------------------------------------------------------
+# ── Themes ───────────────────────────────────────────────────────────────────
 
-# ── Dark theme (Catppuccin Mocha) ──────────────────────────────────────────
-_DARK = {
-    "bg":          "#1e1e2e",
-    "bg2":         "#181825",
-    "surface":     "#313244",
-    "surface2":    "#45475a",
-    "overlay":     "#6c7086",
-    "text":        "#cdd6f4",
-    "subtext":     "#a6adc8",
-    "blue":        "#89b4fa",
-    "blue2":       "#b4befe",
-    "green":       "#a6e3a1",
-    "red":         "#f38ba8",
-    "yellow":      "#f9e2af",
-    "peach":       "#fab387",
-    "mauve":       "#cba6f7",
-    "log_bg":      "#11111b",
-    "log_border":  "#313244",
-    "sep":         "#313244",
+_D = {  # Dark — Catppuccin Mocha
+    "bg":       "#1e1e2e", "bg2":    "#181825", "surface": "#313244",
+    "surf2":    "#45475a", "over":   "#6c7086", "text":    "#cdd6f4",
+    "sub":      "#a6adc8", "blue":   "#89b4fa", "blue2":   "#b4befe",
+    "green":    "#a6e3a1", "red":    "#f38ba8", "yellow":  "#f9e2af",
+    "peach":    "#fab387", "mauve":  "#cba6f7", "log_bg":  "#11111b",
+    "tog_on":   "#89b4fa", "tog_off":"#45475a", "tog_knob":"#cdd6f4",
 }
-
-# ── Light theme (Catppuccin Latte) ─────────────────────────────────────────
-_LIGHT = {
-    "bg":          "#eff1f5",
-    "bg2":         "#e6e9ef",
-    "surface":     "#dce0e8",
-    "surface2":    "#bcc0cc",
-    "overlay":     "#8c8fa1",
-    "text":        "#4c4f69",
-    "subtext":     "#6c6f85",
-    "blue":        "#1e66f5",
-    "blue2":       "#7287fd",
-    "green":       "#40a02b",
-    "red":         "#d20f39",
-    "yellow":      "#df8e1d",
-    "peach":       "#fe640b",
-    "mauve":       "#8839ef",
-    "log_bg":      "#dce0e8",
-    "log_border":  "#bcc0cc",
-    "sep":         "#bcc0cc",
+_L = {  # Light — Catppuccin Latte
+    "bg":       "#eff1f5", "bg2":    "#e6e9ef", "surface": "#dce0e8",
+    "surf2":    "#bcc0cc", "over":   "#8c8fa1", "text":    "#4c4f69",
+    "sub":      "#6c6f85", "blue":   "#1e66f5", "blue2":   "#7287fd",
+    "green":    "#40a02b", "red":    "#d20f39", "yellow":  "#df8e1d",
+    "peach":    "#fe640b", "mauve":  "#8839ef", "log_bg":  "#dce0e8",
+    "tog_on":   "#1e66f5", "tog_off":"#bcc0cc", "tog_knob":"#ffffff",
 }
-
-# Log text colours per theme
-_LOG_COLOURS_DARK: dict[str, str] = {
-    "info":    "#cdd6f4",
-    "success": "#a6e3a1",
-    "warning": "#f9e2af",
-    "error":   "#f38ba8",
-    "ffmpeg":  "#89b4fa",
-    "header":  "#cba6f7",
-}
-_LOG_COLOURS_LIGHT: dict[str, str] = {
-    "info":    "#4c4f69",
-    "success": "#40a02b",
-    "warning": "#df8e1d",
-    "error":   "#d20f39",
-    "ffmpeg":  "#1e66f5",
-    "header":  "#8839ef",
-}
+_LOG_D = {"info":"#cdd6f4","success":"#a6e3a1","warning":"#f9e2af",
+          "error":"#f38ba8","ffmpeg":"#89b4fa","header":"#cba6f7"}
+_LOG_L = {"info":"#4c4f69","success":"#40a02b","warning":"#df8e1d",
+          "error":"#d20f39","ffmpeg":"#1e66f5","header":"#8839ef"}
 
 
-def _build_stylesheet(t: dict) -> str:
+def _ss(t: dict) -> str:
     return f"""
-/* ── Base ── */
-QMainWindow, QDialog  {{ background-color: {t["bg"]}; }}
-QWidget#central        {{ background-color: {t["bg"]}; }}
-QWidget                {{ color: {t["text"]}; }}
-
-/* ── Header bar ── */
-QWidget#header         {{ background-color: {t["bg2"]}; border-bottom: 2px solid {t["blue"]}; }}
-
-/* ── Group boxes ── */
-QGroupBox {{
-    color: {t["text"]};
-    border: 1px solid {t["surface2"]};
-    border-radius: 8px;
-    margin-top: 10px;
-    font-weight: bold;
-    font-size: 12px;
-    padding: 6px 4px 4px 4px;
-}}
-QGroupBox::title {{
-    subcontrol-origin: margin;
-    left: 12px;
-    padding: 0 6px;
-    color: {t["blue"]};
-}}
-
-/* ── Labels ── */
-QLabel              {{ color: {t["text"]}; font-size: 12px; }}
-QLabel#lbl_title    {{ color: {t["blue"]}; font-size: 17px; font-weight: bold; }}
-QLabel#lbl_subtitle {{ color: {t["overlay"]}; font-size: 11px; }}
-QLabel#lbl_stage    {{ color: {t["subtext"]}; font-size: 11px; }}
-QLabel#lbl_file_info{{ color: {t["green"]}; font-size: 12px; font-weight: bold; }}
-QLabel#lbl_plan     {{ color: {t["peach"]}; font-size: 11px; font-style: italic; }}
-QLabel#lbl_elapsed  {{ color: {t["overlay"]}; font-size: 11px; }}
-QLabel#badge_gpu_ok {{ color: {t["green"]}; font-size: 11px; font-weight: bold; }}
-QLabel#badge_gpu_no {{ color: {t["overlay"]}; font-size: 11px; }}
-
-/* ── Inputs ── */
-QLineEdit {{
-    background-color: {t["surface"]};
-    color: {t["text"]};
-    border: 1px solid {t["surface2"]};
-    border-radius: 5px;
-    padding: 5px 10px;
-    font-size: 12px;
-    selection-background-color: {t["blue"]};
-}}
-QLineEdit:focus   {{ border: 1px solid {t["blue"]}; }}
-QLineEdit:disabled{{ color: {t["overlay"]}; background-color: {t["bg2"]}; }}
-
-/* ── Checkbox ── */
-QCheckBox         {{ color: {t["text"]}; font-size: 12px; spacing: 6px; }}
-QCheckBox::indicator {{
-    width: 16px; height: 16px;
-    border: 2px solid {t["surface2"]};
-    border-radius: 3px;
-    background: {t["surface"]};
-}}
-QCheckBox::indicator:checked {{
-    background: {t["blue"]};
-    border-color: {t["blue"]};
-    image: none;
-}}
-
-/* ── General buttons ── */
-QPushButton {{
-    background-color: {t["surface"]};
-    color: {t["text"]};
-    border: 1px solid {t["surface2"]};
-    border-radius: 5px;
-    padding: 5px 14px;
-    font-size: 12px;
-}}
-QPushButton:hover   {{ background-color: {t["surface2"]}; border-color: {t["blue"]}; }}
-QPushButton:pressed {{ background-color: {t["bg2"]}; }}
-QPushButton:disabled{{ color: {t["overlay"]}; background-color: {t["bg2"]}; border-color: {t["surface"]}; }}
-
-/* ── Start button ── */
-QPushButton#btn_start {{
-    background-color: {t["blue"]};
-    color: {t["bg"]};
-    border: none;
-    font-weight: bold;
-    font-size: 13px;
-    padding: 9px 28px;
-    border-radius: 6px;
-}}
-QPushButton#btn_start:hover    {{ background-color: {t["blue2"]}; }}
-QPushButton#btn_start:disabled {{ background-color: {t["surface2"]}; color: {t["overlay"]}; }}
-
-/* ── Cancel button ── */
-QPushButton#btn_cancel {{
-    background-color: {t["red"]};
-    color: {t["bg"]};
-    border: none;
-    font-weight: bold;
-    font-size: 13px;
-    padding: 9px 28px;
-    border-radius: 6px;
-}}
-QPushButton#btn_cancel:hover    {{ background-color: #f5a3b8; }}
-QPushButton#btn_cancel:disabled {{ background-color: {t["surface2"]}; color: {t["overlay"]}; }}
-
-/* ── Theme toggle button ── */
-QPushButton#btn_theme {{
-    background-color: transparent;
-    border: 1px solid {t["surface2"]};
-    border-radius: 14px;
-    padding: 3px 10px;
-    font-size: 14px;
-    color: {t["text"]};
-}}
-QPushButton#btn_theme:hover {{ background-color: {t["surface"]}; }}
-
-/* ── Log view ── */
-QPlainTextEdit {{
-    background-color: {t["log_bg"]};
-    color: {t["text"]};
-    border: 1px solid {t["log_border"]};
-    border-radius: 6px;
-    font-family: "Consolas", "Cascadia Code", "Courier New", monospace;
-    font-size: 11px;
-    padding: 4px;
-}}
-
-/* ── Progress bar ── */
-QProgressBar {{
-    background-color: {t["surface"]};
-    border: none;
-    border-radius: 5px;
-    height: 16px;
-    text-align: center;
-    color: {t["text"]};
-    font-size: 11px;
-    font-weight: bold;
-}}
-QProgressBar::chunk {{
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 {t["blue"]}, stop:1 {t["mauve"]}
-    );
-    border-radius: 5px;
-}}
-
-/* ── Separator ── */
-QFrame#sep {{ color: {t["sep"]}; }}
-
-/* ── Scrollbar ── */
-QScrollBar:vertical {{
-    background: {t["bg2"]};
-    width: 8px;
-    border-radius: 4px;
-}}
-QScrollBar::handle:vertical {{
-    background: {t["surface2"]};
-    border-radius: 4px;
-    min-height: 20px;
-}}
-QScrollBar::handle:vertical:hover {{ background: {t["overlay"]}; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QMainWindow,QDialog{{background:{t["bg"]};}}
+QWidget#root{{background:{t["bg"]};}}
+QWidget#header{{background:{t["bg2"]};border-bottom:2px solid {t["blue"]};}}
+QGroupBox{{color:{t["text"]};border:1px solid {t["surf2"]};border-radius:8px;
+    margin-top:10px;font-weight:bold;font-size:12px;padding:6px 4px 4px 4px;}}
+QGroupBox::title{{subcontrol-origin:margin;left:12px;padding:0 6px;color:{t["blue"]};}}
+QLabel{{color:{t["text"]};font-size:12px;}}
+QLabel#title{{color:{t["blue"]};font-size:18px;font-weight:bold;}}
+QLabel#sub{{color:{t["over"]};font-size:11px;}}
+QLabel#stage{{color:{t["sub"]};font-size:11px;}}
+QLabel#elapsed{{color:{t["over"]};font-size:11px;}}
+QLabel#gpu_badge{{font-size:11px;font-weight:bold;}}
+QLabel#fps_lbl{{color:{t["sub"]};font-size:12px;}}
+QLineEdit{{background:{t["surface"]};color:{t["text"]};border:1px solid {t["surf2"]};
+    border-radius:5px;padding:5px 10px;font-size:12px;}}
+QLineEdit:focus{{border:1px solid {t["blue"]};}}
+QLineEdit:disabled{{color:{t["over"]};background:{t["bg2"]};}}
+QDoubleSpinBox{{background:{t["surface"]};color:{t["text"]};border:1px solid {t["surf2"]};
+    border-radius:5px;padding:4px 8px;font-size:12px;}}
+QDoubleSpinBox:focus{{border:1px solid {t["blue"]};}}
+QDoubleSpinBox::up-button,QDoubleSpinBox::down-button{{
+    background:{t["surf2"]};border:none;border-radius:3px;width:16px;}}
+QPushButton{{background:{t["surface"]};color:{t["text"]};border:1px solid {t["surf2"]};
+    border-radius:5px;padding:5px 14px;font-size:12px;}}
+QPushButton:hover{{background:{t["surf2"]};border-color:{t["blue"]};}}
+QPushButton:pressed{{background:{t["bg2"]};}}
+QPushButton:disabled{{color:{t["over"]};background:{t["bg2"]};border-color:{t["surface"]};}}
+QPushButton#start{{background:{t["blue"]};color:{t["bg"]};border:none;
+    font-weight:bold;font-size:13px;padding:9px 30px;border-radius:6px;}}
+QPushButton#start:hover{{background:{t["blue2"]};}}
+QPushButton#start:disabled{{background:{t["surf2"]};color:{t["over"]};}}
+QPushButton#cancel{{background:{t["red"]};color:{t["bg"]};border:none;
+    font-weight:bold;font-size:13px;padding:9px 30px;border-radius:6px;}}
+QPushButton#cancel:hover{{background:#f5a3b8;}}
+QPushButton#cancel:disabled{{background:{t["surf2"]};color:{t["over"]};}}
+QPushButton#theme_btn{{background:transparent;border:1px solid {t["surf2"]};
+    border-radius:14px;padding:3px 10px;font-size:15px;color:{t["text"]};}}
+QPushButton#theme_btn:hover{{background:{t["surface"]};}}
+QPushButton#remove_btn{{background:transparent;border:none;
+    color:{t["red"]};font-size:14px;padding:2px 6px;border-radius:3px;}}
+QPushButton#remove_btn:hover{{background:{t["surface"]};}}
+QListWidget{{background:{t["surface"]};color:{t["text"]};border:1px solid {t["surf2"]};
+    border-radius:6px;font-size:11px;outline:none;}}
+QListWidget::item{{padding:3px 6px;border-radius:3px;}}
+QListWidget::item:selected{{background:{t["blue"]};color:{t["bg"]};}}
+QListWidget::item:hover{{background:{t["surf2"]};}}
+QPlainTextEdit{{background:{t["log_bg"]};color:{t["text"]};border:1px solid {t["surf2"]};
+    border-radius:6px;font-family:"Consolas","Cascadia Code","Courier New",monospace;
+    font-size:11px;padding:4px;}}
+QProgressBar{{background:{t["surface"]};border:none;border-radius:5px;height:16px;
+    text-align:center;color:{t["text"]};font-size:11px;font-weight:bold;}}
+QProgressBar::chunk{{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+    stop:0 {t["blue"]},stop:1 {t["mauve"]});border-radius:5px;}}
+QFrame#sep{{color:{t["surf2"]};}}
+QScrollBar:vertical{{background:{t["bg2"]};width:8px;border-radius:4px;}}
+QScrollBar::handle:vertical{{background:{t["surf2"]};border-radius:4px;min-height:20px;}}
+QScrollBar::handle:vertical:hover{{background:{t["over"]};}}
+QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
 """
 
 
-# ---------------------------------------------------------------------------
-# Worker Thread
-# ---------------------------------------------------------------------------
+# ── Custom toggle switch widget ───────────────────────────────────────────────
 
-class ConversionWorker(QThread):
+class ToggleSwitch(QWidget):
     """
-    Background QThread for the full DAV → MP4 pipeline.
-
-    All heavy work (FFmpeg subprocesses) runs here.
-    Signals carry results back to the GUI thread.
+    Animated pill-style toggle switch.
+    Emits toggled(bool) when clicked.
     """
 
-    log_message      = pyqtSignal(str, str)   # (text, level)
-    progress_updated = pyqtSignal(int, int)   # (current, total)
-    stage_changed    = pyqtSignal(str)
-    plan_determined  = pyqtSignal(str)
-    finished         = pyqtSignal(bool, str)  # (success, output_path_or_error)
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._checked   = False
+        self._anim_pos  = 0.0          # 0.0 = off, 1.0 = on
+        self._on_color  = QColor("#89b4fa")
+        self._off_color = QColor("#45475a")
+        self._knob_col  = QColor("#cdd6f4")
+        self.setFixedSize(48, 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self._anim = QPropertyAnimation(self, b"anim_pos", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+    # Qt property for animation
+    @pyqtProperty(float)
+    def anim_pos(self) -> float:           # type: ignore[override]
+        return self._anim_pos
+
+    @anim_pos.setter                       # type: ignore[override]
+    def anim_pos(self, v: float) -> None:
+        self._anim_pos = v
+        self.update()
+
+    def set_colors(self, on: str, off: str, knob: str) -> None:
+        self._on_color  = QColor(on)
+        self._off_color = QColor(off)
+        self._knob_col  = QColor(knob)
+        self.update()
+
+    @property
+    def checked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, v: bool) -> None:
+        if v == self._checked:
+            return
+        self._checked = v
+        self._anim.stop()
+        self._anim.setStartValue(self._anim_pos)
+        self._anim.setEndValue(1.0 if v else 0.0)
+        self._anim.start()
+
+    def mousePressEvent(self, _) -> None:  # type: ignore[override]
+        self.setChecked(not self._checked)
+        self.toggled.emit(self._checked)
+
+    def paintEvent(self, _) -> None:       # type: ignore[override]
+        p  = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r    = h / 2
+
+        # Interpolate track colour
+        t   = self._anim_pos
+        col = QColor(
+            int(self._off_color.red()   + t * (self._on_color.red()   - self._off_color.red())),
+            int(self._off_color.green() + t * (self._on_color.green() - self._off_color.green())),
+            int(self._off_color.blue()  + t * (self._on_color.blue()  - self._off_color.blue())),
+        )
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(0, 0, w, h, r, r)
+
+        # Knob
+        knob_d   = h - 6
+        knob_x   = 3 + t * (w - knob_d - 6)
+        p.setBrush(self._knob_col)
+        p.drawEllipse(int(knob_x), 3, knob_d, knob_d)
+        p.end()
+
+
+# ── Drop-enabled file list ────────────────────────────────────────────────────
+
+class FileListWidget(QListWidget):
+    """QListWidget that accepts dropped .dav (and other video) files."""
+
+    files_added = pyqtSignal(list)   # list[Path]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+    def dragEnterEvent(self, e: QDragEnterEvent) -> None:
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e) -> None:   # type: ignore[override]
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e: QDropEvent) -> None:
+        paths: list[Path] = []
+        for url in e.mimeData().urls():
+            p = Path(url.toLocalFile())
+            if p.is_file():
+                paths.append(p)
+            elif p.is_dir():
+                paths.extend(p.rglob("*.dav"))
+                paths.extend(p.rglob("*.DAV"))
+        if paths:
+            self.files_added.emit(natural_sorted(paths))
+
+
+# ── Worker thread ─────────────────────────────────────────────────────────────
+
+class Worker(QThread):
+    """Runs the full pipeline in a background thread."""
+
+    log_msg    = pyqtSignal(str, str)   # (text, level)
+    progress   = pyqtSignal(int, int)   # (done, total)
+    stage      = pyqtSignal(str)
+    finished   = pyqtSignal(bool, str)  # (success, output_or_error)
 
     def __init__(
         self,
-        input_folder:  str,
-        output_file:   str,
-        ffmpeg_path:   str,
-        ffprobe_path:  str,
-        use_gpu:       bool = False,
-        parent:        QWidget | None = None,
+        clips:      list[Path],
+        output:     Path,
+        reencode:   bool,
+        target_fps: float,
+        parent:     QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._input_folder = Path(input_folder)
-        self._output_file  = ensure_mp4_extension(output_file)
-        self._use_gpu      = use_gpu
-        self._processor    = FFmpegProcessor(
-            ffmpeg_path=ffmpeg_path,
-            ffprobe_path=ffprobe_path,
-            use_gpu=use_gpu,
-            max_workers=4,
-            segment_duration=SEGMENT_DURATION_SEC,
-        )
-        self._start_time = 0.0
+        self._clips      = clips
+        self._output     = output
+        self._reencode   = reencode
+        self._target_fps = target_fps
+        self._proc       = Processor()
+        self._t0         = 0.0
 
     def cancel(self) -> None:
-        self._processor.cancel()
+        self._proc.cancel()
 
     def run(self) -> None:
-        self._processor.reset()
-        self._start_time = time.monotonic()
+        self._proc.reset()
+        self._t0 = time.monotonic()
 
-        def log(msg: str, level: str = "info") -> None:
-            elapsed = time.monotonic() - self._start_time
-            ts = str(timedelta(seconds=int(elapsed)))
-            self.log_message.emit(f"[{ts}] {msg}", level)
+        def log(msg: str, lv: str = "info") -> None:
+            elapsed = timedelta(seconds=int(time.monotonic() - self._t0))
+            self.log_msg.emit(f"[{elapsed}] {msg}", lv)
 
-        # ── 0. Verify FFmpeg ──────────────────────────────────────────
-        log("─── Checking FFmpeg installation…", "header")
-        ok, version_msg = self._processor.detect_ffmpeg()
+        # ── Verify FFmpeg ─────────────────────────────────────────────
+        log("─── Verifying internal FFmpeg bundle…", "header")
+        ok, ver = self._proc.verify_ffmpeg()
         if not ok:
-            log(f"FFmpeg not found: {version_msg}", "error")
-            self.finished.emit(False, f"FFmpeg not found: {version_msg}")
+            log(f"FFmpeg not found: {ver}", "error")
+            self.finished.emit(False, f"FFmpeg not found: {ver}")
             return
-        log(f"Found: {version_msg}", "success")
+        log(f"FFmpeg OK: {ver}", "success")
 
-        if self._use_gpu:
-            log("─── Checking GPU (NVENC) availability…", "header")
-            nvenc = self._processor.detect_nvenc()
-            if nvenc:
-                log("NVENC hardware encoder: available ✓", "success")
-            else:
-                log(
-                    "NVENC not available — falling back to CPU (libx264).",
-                    "warning",
-                )
-
-        # ── 1. Discover source files ──────────────────────────────────
-        log("─── Scanning input folder…", "header")
-        try:
-            dav_files = find_dav_files(self._input_folder)
-        except NotADirectoryError as exc:
-            log(str(exc), "error")
-            self.finished.emit(False, str(exc))
-            return
-
-        if not dav_files:
-            log("No .dav files found in the selected folder.", "error")
-            self.finished.emit(False, "No .dav files found.")
-            return
-
-        log(f"Found {len(dav_files)} .dav file(s):", "success")
-        for i, f in enumerate(dav_files, 1):
-            log(f"  [{i:>3}] {f.name}", "info")
-
-        # ── 2. Probe all files in parallel ────────────────────────────
-        log("─── Probing source files (parallel)…", "header")
-        self.stage_changed.emit("Probing source files…")
-        self.progress_updated.emit(0, len(dav_files))
-
-        video_infos = self._processor.probe_all_parallel(
-            dav_files,
-            log,
-            on_progress=lambda c, t: self.progress_updated.emit(c, t),
-        )
-
-        if not video_infos:
-            log("All probes failed — nothing to process.", "error")
-            self.finished.emit(False, "All source probes failed.")
-            return
-
-        # ── FIX: use SEGMENT_DURATION_SEC, NOT sum of probe durations ──
-        total_expected = float(SEGMENT_DURATION_SEC * len(video_infos))
-        log(
-            f"Segments: {len(video_infos)}  |  "
-            f"Expected output: {timedelta(seconds=int(total_expected))} "
-            f"({total_expected:.0f}s exactly)",
-            "success",
-        )
-
-        # ── 3. Build encoding plan ────────────────────────────────────
-        log("─── Determining encoding strategy…", "header")
-        plan = self._processor.build_plan(video_infos, force_gpu=self._use_gpu)
-        log(f"Strategy: {plan.reason}", "success")
-        self.plan_determined.emit(f"⚙ {plan.reason}")
-
-        # ── 4. Process each segment ───────────────────────────────────
-        action = "Copying" if plan.use_stream_copy else "Transcoding"
-        log(f"─── {action} segments…", "header")
-
-        temp_dir    = make_temp_dir()
-        temp_files: list[Path]              = []
-        segments:   list[tuple[Path, float]] = []
-        total_steps = len(video_infos)
-        self.progress_updated.emit(0, total_steps)
-
-        for i, info in enumerate(video_infos):
-            if self._processor.is_cancelled:
-                cleanup_files(temp_files, lambda m: log(m, "warning"))
-                log("Conversion cancelled by user.", "warning")
+        # ── Probe all clips ───────────────────────────────────────────
+        log(f"─── Probing {len(self._clips)} source file(s)…", "header")
+        self.stage.emit("Probing files…")
+        infos: list[ClipInfo] = []
+        for i, path in enumerate(self._clips):
+            if self._proc.cancelled:
                 self.finished.emit(False, "")
                 return
+            try:
+                info = self._proc.probe(path)
+                log(f"  [{i+1:>3}] {path.name}  "
+                    f"{info.fps:.2f}fps  {info.duration:.2f}s  "
+                    f"{info.codec}  {info.width}×{info.height}", "info")
+                infos.append(info)
+            except RuntimeError as e:
+                log(f"  [SKIP] {path.name}: {e}", "warning")
 
-            temp_out  = temp_dir / f"{str(i).zfill(4)}.mp4"
-            stage_msg = f"{action} {i + 1}/{total_steps}: {info.path.name}"
-            self.stage_changed.emit(stage_msg)
-            log(f"─── [{i + 1}/{total_steps}] {stage_msg}", "header")
-
-            if plan.use_stream_copy:
-                ok = self._processor.copy_segment(info, temp_out, log)
-            else:
-                ok = self._processor.transcode_segment(info, temp_out, plan, log)
-
-            if not ok:
-                cleanup_files(temp_files, lambda m: log(m, "warning"))
-                if self._processor.is_cancelled:
-                    log("Conversion cancelled by user.", "warning")
-                    self.finished.emit(False, "")
-                else:
-                    log(f"Processing failed for {info.path.name}.", "error")
-                    self.finished.emit(False, f"Processing failed: {info.path.name}")
-                return
-
-            temp_files.append(temp_out)
-            # ── FIX: always use SEGMENT_DURATION_SEC, NOT info.duration ──
-            segments.append((temp_out, float(SEGMENT_DURATION_SEC)))
-            self.progress_updated.emit(i + 1, total_steps)
-            log(f"  ✓ Segment {i + 1} complete.", "success")
-
-        # ── 5. Write concat list ──────────────────────────────────────
-        log("─── Writing concat playlist…", "header")
-        self.stage_changed.emit("Writing concat playlist…")
-        list_path = temp_dir / "concat_list.txt"
-        self._processor.write_concat_list(segments, list_path)
-        log(f"  Playlist written ({len(segments)} entries × {SEGMENT_DURATION_SEC}s each)", "info")
-
-        # ── 6. Concatenate ────────────────────────────────────────────
-        log("─── Concatenating all segments into final output…", "header")
-        self.stage_changed.emit("Concatenating segments…")
-        self.progress_updated.emit(0, 1)
-
-        self._output_file.parent.mkdir(parents=True, exist_ok=True)
-        ok = self._processor.concatenate_segments(list_path, self._output_file, log)
-
-        if not ok:
-            cleanup_files(temp_files + [list_path], lambda m: log(m, "warning"))
-            if self._processor.is_cancelled:
-                log("Conversion cancelled by user.", "warning")
-                self.finished.emit(False, "")
-            else:
-                self.finished.emit(False, "Concatenation failed.")
+        if not infos:
+            log("No valid clips found.", "error")
+            self.finished.emit(False, "No valid clips to process.")
             return
 
-        self.progress_updated.emit(1, 1)
+        n           = len(infos)
+        expected_s  = n * SEGMENT_DURATION
+        log(f"  {n} clip(s) × {SEGMENT_DURATION}s = {expected_s}s expected "
+            f"({timedelta(seconds=expected_s)})", "success")
+        self.progress.emit(0, n)
 
-        # ── 7. Cleanup ────────────────────────────────────────────────
-        log("─── Cleaning up temporary files…", "header")
-        self.stage_changed.emit("Cleaning up…")
-        cleanup_files(temp_files + [list_path], lambda m: log(m, "warning"))
-        try:
-            temp_dir.rmdir()
-        except OSError:
-            pass
+        # ── Detect GPU (for re-encode mode) ───────────────────────────
+        gpu: GPUInfo | None = None
+        if self._reencode:
+            log("─── Detecting hardware encoder…", "header")
+            gpu = detect_best(get_ffmpeg())
+            log(f"  Selected: {gpu.label}", "success" if gpu.detected else "warning")
 
-        # ── 8. Summary ────────────────────────────────────────────────
-        elapsed = time.monotonic() - self._start_time
-        log(
-            f"─── ✓ Done!\n"
-            f"    Output    : {self._output_file}\n"
-            f"    Expected  : {timedelta(seconds=int(total_expected))} "
-            f"({total_expected:.0f}s — {len(video_infos)} × {SEGMENT_DURATION_SEC}s)\n"
-            f"    Wall time : {timedelta(seconds=int(elapsed))}\n"
-            f"    Strategy  : {plan.reason}\n"
-            f"    Verify    : ffprobe -v error -show_entries format=duration "
-            f'-of default=noprint_wrappers=1 "{self._output_file}"',
-            "success",
-        )
-        self.stage_changed.emit(f"✓ Finished! → {self._output_file.name}")
-        self.finished.emit(True, str(self._output_file))
+        # ── Run pipeline ──────────────────────────────────────────────
+        self._output.parent.mkdir(parents=True, exist_ok=True)
 
-
-# ---------------------------------------------------------------------------
-# Drop-enabled QLineEdit
-# ---------------------------------------------------------------------------
-
-class DropLineEdit(QLineEdit):
-    """QLineEdit that accepts folder/file drag-and-drop."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        if not self._reencode:
+            log("─── Starting lossless pass-through…", "header")
+            self.stage.emit("Merging (lossless copy)…")
+            ok = self._proc.run_lossless(
+                infos, self._output, log,
+                on_progress=lambda c, t: self.progress.emit(c, t),
+            )
         else:
-            super().dragEnterEvent(event)
+            log(f"─── Starting re-encode @ {self._target_fps} FPS…", "header")
+            self.stage.emit(f"Transcoding @ {self._target_fps} FPS…")
+            ok = self._proc.run_reencode(
+                infos, self._output, self._target_fps, gpu, log,  # type: ignore[arg-type]
+                on_progress=lambda c, t: self.progress.emit(c, t),
+            )
 
-    def dropEvent(self, event: QDropEvent) -> None:
-        urls = event.mimeData().urls()
-        if urls:
-            self.setText(urls[0].toLocalFile())
+        if self._proc.cancelled:
+            self.finished.emit(False, "")
+            return
+
+        elapsed = timedelta(seconds=int(time.monotonic() - self._t0))
+        if ok:
+            log(f"─── ✓ Done in {elapsed} → {self._output}", "success")
+            self.finished.emit(True, str(self._output))
         else:
-            super().dropEvent(event)
+            self.finished.emit(False, "Processing failed. Check the log.")
 
 
-# ---------------------------------------------------------------------------
-# Main Window
-# ---------------------------------------------------------------------------
+# ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    """Top-level application window for DAV Consolidator v3."""
 
-    APP_TITLE  = "DAV Consolidator"
-    APP_VER    = "v3.0"
-    MIN_WIDTH  = 900
-    MIN_HEIGHT = 760
+    TITLE = "DAV Consolidator"
+    VER   = "v4.0"
 
     def __init__(self) -> None:
         super().__init__()
-        self._worker:    ConversionWorker | None = None
-        self._dark_mode: bool                   = True
-        self._log_colours = _LOG_COLOURS_DARK
+        self._dark     = True
+        self._log_col  = _LOG_D
+        self._worker:  Worker | None = None
+        self._gpu_info: list[GPUInfo] = []
+        self._clips:   list[Path]    = []
 
-        # Elapsed-time counter
-        self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.setInterval(1000)
-        self._elapsed_timer.timeout.connect(self._tick_elapsed)
-        self._run_start = 0.0
+        self._elapsed_t = QTimer(self)
+        self._elapsed_t.setInterval(1000)
+        self._elapsed_t.timeout.connect(self._tick)
+        self._t0 = 0.0
 
-        self._setup_ui()
+        self._build_ui()
         self._apply_theme()
         self._post_init()
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    # ── UI construction ────────────────────────────────────────────────
 
-    def _setup_ui(self) -> None:
-        self.setWindowTitle(f"{self.APP_TITLE} {self.APP_VER}")
-        self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
-        self.resize(1020, 860)
-        self.setAcceptDrops(True)
+    def _build_ui(self) -> None:
+        self.setWindowTitle(f"{self.TITLE} {self.VER}")
+        self.setMinimumSize(860, 760)
+        self.resize(960, 840)
 
-        central = QWidget(objectName="central")
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setSpacing(10)
-        root.setContentsMargins(0, 0, 0, 12)
+        root = QWidget(objectName="root")
+        self.setCentralWidget(root)
+        vbox = QVBoxLayout(root)
+        vbox.setSpacing(0)
+        vbox.setContentsMargins(0, 0, 0, 0)
 
-        # ── Header bar ────────────────────────────────────────────────
-        root.addWidget(self._build_header())
+        vbox.addWidget(self._build_header())
 
-        # ── Body ──────────────────────────────────────────────────────
         body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setSpacing(10)
-        body_layout.setContentsMargins(16, 8, 16, 0)
+        bl   = QVBoxLayout(body)
+        bl.setSpacing(10)
+        bl.setContentsMargins(18, 12, 18, 12)
 
-        body_layout.addWidget(self._build_config_group())
-        body_layout.addLayout(self._build_info_row())
-        body_layout.addWidget(self._build_log_group(), stretch=1)
-        body_layout.addLayout(self._build_progress_section())
-        body_layout.addWidget(self._build_separator())
-        body_layout.addLayout(self._build_action_row())
+        bl.addWidget(self._build_files_group())
+        bl.addWidget(self._build_output_group())
+        bl.addWidget(self._build_engine_group())
+        bl.addWidget(self._build_log_group(), stretch=1)
+        bl.addLayout(self._build_progress_row())
+        bl.addWidget(self._hline())
+        bl.addLayout(self._build_action_row())
 
-        root.addWidget(body, stretch=1)
+        vbox.addWidget(body, stretch=1)
 
-    # ------------------------------------------------------------------
-    # Header
-    # ------------------------------------------------------------------
+    # ── Header ────────────────────────────────────────────────────────
 
     def _build_header(self) -> QWidget:
-        header = QWidget(objectName="header")
-        hl = QHBoxLayout(header)
-        hl.setContentsMargins(16, 10, 16, 10)
+        hdr = QWidget(objectName="header")
+        hl  = QHBoxLayout(hdr)
+        hl.setContentsMargins(18, 10, 18, 10)
 
-        # Title + subtitle
-        title_col = QVBoxLayout()
-        title_col.setSpacing(2)
-        lbl_title = QLabel(f"🎬  {self.APP_TITLE} {self.APP_VER}", objectName="lbl_title")
-        lbl_title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
-        lbl_subtitle = QLabel(
-            "Forensic-accurate DAV → MP4  ·  Zero frame loss  ·  GPU / CPU",
-            objectName="lbl_subtitle",
-        )
-        title_col.addWidget(lbl_title)
-        title_col.addWidget(lbl_subtitle)
-        hl.addLayout(title_col)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(f"🎬  {self.TITLE} {self.VER}", objectName="title")
+        t.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        s = QLabel("High-fidelity video merger  ·  Lossless or GPU-accelerated",
+                   objectName="sub")
+        col.addWidget(t)
+        col.addWidget(s)
+        hl.addLayout(col)
         hl.addStretch()
 
         # GPU badge
-        gpu_col = QVBoxLayout()
-        gpu_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._gpu_badge = QLabel("⚡ GPU: detecting…", objectName="badge_gpu_no")
-        gpu_col.addWidget(self._gpu_badge)
-        hl.addLayout(gpu_col)
-        hl.addSpacing(16)
+        self._gpu_badge = QLabel("⚡ detecting…", objectName="gpu_badge")
+        hl.addWidget(self._gpu_badge)
+        hl.addSpacing(14)
 
         # Theme toggle
-        self._btn_theme = QPushButton("☀", objectName="btn_theme")
+        self._btn_theme = QPushButton("☀", objectName="theme_btn")
         self._btn_theme.setFixedSize(36, 36)
         self._btn_theme.setToolTip("Toggle dark / light theme")
         self._btn_theme.clicked.connect(self._toggle_theme)
         hl.addWidget(self._btn_theme)
+        return hdr
 
-        return header
+    # ── File list group ────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Configuration group
-    # ------------------------------------------------------------------
+    def _build_files_group(self) -> QGroupBox:
+        grp = QGroupBox("Source Files")
+        vl  = QVBoxLayout(grp)
+        vl.setSpacing(6)
 
-    def _build_config_group(self) -> QGroupBox:
-        grp = QGroupBox("Configuration")
-        layout = QVBoxLayout(grp)
-        layout.setSpacing(8)
+        # List
+        self._file_list = FileListWidget()
+        self._file_list.setFixedHeight(160)
+        self._file_list.files_added.connect(self._add_files)
+        vl.addWidget(self._file_list)
 
-        self._input_edit, r1, _ = self._path_row(
-            "Input Folder:", "Drag & drop or browse for folder containing .dav files…",
-            browse_dir=True,
-        )
-        self._output_edit, r2, _ = self._path_row(
-            "Output File:", "Select output .mp4 path (auto-filled from DAV filenames)…",
-            browse_dir=False,
-        )
-        self._ffmpeg_edit, r3, ff_btn = self._path_row(
-            "FFmpeg Path:", "auto-detected or system PATH",
-            browse_dir=False, browse_label="Browse",
-        )
-        ff_btn.clicked.disconnect()
-        ff_btn.clicked.connect(self._browse_ffmpeg)
+        # Buttons row
+        btn_row = QHBoxLayout()
+        b_add   = QPushButton("＋ Add Files")
+        b_add.clicked.connect(self._browse_files)
+        b_dir   = QPushButton("📁 Add Folder")
+        b_dir.clicked.connect(self._browse_folder)
+        b_clr   = QPushButton("✕ Clear All")
+        b_clr.clicked.connect(self._clear_files)
+        b_rem   = QPushButton("Remove Selected")
+        b_rem.clicked.connect(self._remove_selected)
 
-        layout.addLayout(r1)
-        layout.addLayout(r2)
-        layout.addLayout(r3)
+        for b in (b_add, b_dir, b_clr, b_rem):
+            btn_row.addWidget(b)
+        btn_row.addStretch()
 
-        # GPU row
-        gpu_row = QHBoxLayout()
-        self._gpu_check = QCheckBox(
-            "Enable GPU acceleration (NVIDIA NVENC — auto-fallback to CPU)"
-        )
-        self._gpu_check.setToolTip(
-            "Uses NVIDIA NVENC for faster H.264 encoding.\n"
-            "Automatically falls back to libx264 if no NVENC GPU is found."
-        )
-        self._gpu_check.toggled.connect(self._on_gpu_toggled)
-        gpu_row.addWidget(self._gpu_check)
-        gpu_row.addStretch()
-        layout.addLayout(gpu_row)
-
-        # Wire input folder → auto-fill output
-        self._input_edit.textChanged.connect(self._refresh_file_info)
+        self._file_count = QLabel("No files loaded.")
+        self._file_count.setObjectName("stage")
+        btn_row.addWidget(self._file_count)
+        vl.addLayout(btn_row)
 
         return grp
 
-    def _path_row(
-        self,
-        label:        str,
-        placeholder:  str,
-        *,
-        browse_dir:   bool,
-        browse_label: str = "Browse…",
-    ) -> tuple[DropLineEdit, QHBoxLayout, QPushButton]:
-        row  = QHBoxLayout()
-        lbl  = QLabel(label)
-        lbl.setFixedWidth(110)
-        edit = DropLineEdit()
-        edit.setPlaceholderText(placeholder)
-        btn  = QPushButton(browse_label)
-        btn.setFixedWidth(90)
+    # ── Output group ───────────────────────────────────────────────────
 
-        if browse_dir:
-            btn.clicked.connect(lambda: self._browse_folder(edit))
-        else:
-            btn.clicked.connect(lambda: self._browse_file(edit))
+    def _build_output_group(self) -> QGroupBox:
+        grp = QGroupBox("Output File")
+        hl  = QHBoxLayout(grp)
+        hl.setSpacing(8)
 
-        row.addWidget(lbl)
-        row.addWidget(edit, stretch=1)
-        row.addWidget(btn)
-        return edit, row, btn
+        self._output_edit = QLineEdit()
+        self._output_edit.setPlaceholderText("Select output .mp4 path…")
+        b = QPushButton("Browse…")
+        b.setFixedWidth(90)
+        b.clicked.connect(self._browse_output)
+        hl.addWidget(self._output_edit, stretch=1)
+        hl.addWidget(b)
+        return grp
 
-    # ------------------------------------------------------------------
-    # Info row (file count + plan label)
-    # ------------------------------------------------------------------
+    # ── Engine group ───────────────────────────────────────────────────
 
-    def _build_info_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setContentsMargins(2, 0, 2, 0)
+    def _build_engine_group(self) -> QGroupBox:
+        grp = QGroupBox("Processing Engine")
+        vl  = QVBoxLayout(grp)
+        vl.setSpacing(10)
 
-        self._file_info_label = QLabel("No folder selected.")
-        self._file_info_label.setObjectName("lbl_file_info")
+        # Toggle row
+        tog_row = QHBoxLayout()
+        lbl_off = QLabel("Lossless Pass-Through")
+        lbl_off.setStyleSheet("font-weight:bold;")
 
-        self._plan_label = QLabel("")
-        self._plan_label.setObjectName("lbl_plan")
-        self._plan_label.setWordWrap(True)
+        self._toggle = ToggleSwitch()
+        self._toggle.toggled.connect(self._on_toggle)
 
-        row.addWidget(self._file_info_label)
-        row.addStretch()
-        row.addWidget(self._plan_label)
-        return row
+        lbl_on = QLabel("Smart Re-encoding")
+        lbl_on.setStyleSheet("font-weight:bold;")
 
-    # ------------------------------------------------------------------
-    # Log group
-    # ------------------------------------------------------------------
+        self._mode_desc = QLabel(
+            "OFF — raw bitstream copy, zero decode/encode, "
+            "mathematically exact duration."
+        )
+        self._mode_desc.setObjectName("stage")
+        self._mode_desc.setWordWrap(True)
+
+        tog_row.addWidget(lbl_off)
+        tog_row.addSpacing(10)
+        tog_row.addWidget(self._toggle)
+        tog_row.addSpacing(10)
+        tog_row.addWidget(lbl_on)
+        tog_row.addStretch()
+        vl.addLayout(tog_row)
+        vl.addWidget(self._mode_desc)
+
+        # FPS row (hidden when toggle OFF)
+        self._fps_row_widget = QWidget()
+        fps_hl = QHBoxLayout(self._fps_row_widget)
+        fps_hl.setContentsMargins(0, 0, 0, 0)
+        fps_lbl = QLabel("Target FPS:", objectName="fps_lbl")
+        fps_lbl.setFixedWidth(80)
+        self._fps_spin = QDoubleSpinBox()
+        self._fps_spin.setRange(1.0, 120.0)
+        self._fps_spin.setValue(25.0)
+        self._fps_spin.setSingleStep(1.0)
+        self._fps_spin.setDecimals(2)
+        self._fps_spin.setFixedWidth(100)
+        self._fps_spin.setToolTip(
+            "Target frame rate for re-encoded output.\n"
+            "Common values: 15, 20, 25, 30, 50, 60"
+        )
+        fps_hl.addWidget(fps_lbl)
+        fps_hl.addWidget(self._fps_spin)
+        fps_hl.addStretch()
+        self._fps_row_widget.hide()
+        vl.addWidget(self._fps_row_widget)
+
+        return grp
+
+    # ── Log group ──────────────────────────────────────────────────────
 
     def _build_log_group(self) -> QGroupBox:
-        grp    = QGroupBox("Conversion Log")
-        layout = QVBoxLayout(grp)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        grp = QGroupBox("Log")
+        vl  = QVBoxLayout(grp)
+        vl.setContentsMargins(6, 6, 6, 6)
+        vl.setSpacing(4)
 
-        self._log_view = QPlainTextEdit()
-        self._log_view.setReadOnly(True)
-        self._log_view.setMaximumBlockCount(12_000)
-        self._log_view.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        layout.addWidget(self._log_view)
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(15_000)
+        vl.addWidget(self._log)
 
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_clear = QPushButton("Clear Log")
-        btn_clear.setFixedWidth(90)
-        btn_clear.clicked.connect(self._log_view.clear)
-        btn_row.addWidget(btn_clear)
-        layout.addLayout(btn_row)
-
+        hl = QHBoxLayout()
+        hl.addStretch()
+        btn_clr = QPushButton("Clear")
+        btn_clr.setFixedWidth(70)
+        btn_clr.clicked.connect(self._log.clear)
+        hl.addWidget(btn_clr)
+        vl.addLayout(hl)
         return grp
 
-    # ------------------------------------------------------------------
-    # Progress section
-    # ------------------------------------------------------------------
+    # ── Progress row ───────────────────────────────────────────────────
 
-    def _build_progress_section(self) -> QVBoxLayout:
-        layout = QVBoxLayout()
-        layout.setSpacing(4)
+    def _build_progress_row(self) -> QVBoxLayout:
+        vl = QVBoxLayout()
+        vl.setSpacing(4)
 
-        row = QHBoxLayout()
-        self._stage_label = QLabel("Idle")
-        self._stage_label.setObjectName("lbl_stage")
-        row.addWidget(self._stage_label, stretch=1)
-
-        self._elapsed_label = QLabel("")
-        self._elapsed_label.setObjectName("lbl_elapsed")
-        self._elapsed_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        row.addWidget(self._elapsed_label)
-        layout.addLayout(row)
+        hl = QHBoxLayout()
+        self._stage_lbl   = QLabel("Idle", objectName="stage")
+        self._elapsed_lbl = QLabel("", objectName="elapsed")
+        self._elapsed_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        hl.addWidget(self._stage_lbl, stretch=1)
+        hl.addWidget(self._elapsed_lbl)
+        vl.addLayout(hl)
 
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
-        self._progress.setTextVisible(True)
         self._progress.setFormat("%p%  (%v / %m)")
         self._progress.setFixedHeight(18)
-        layout.addWidget(self._progress)
+        vl.addWidget(self._progress)
+        return vl
 
-        return layout
-
-    def _build_separator(self) -> QFrame:
-        sep = QFrame(objectName="sep")
-        sep.setFrameShape(QFrame.Shape.HLine)
-        return sep
-
-    # ------------------------------------------------------------------
-    # Action buttons
-    # ------------------------------------------------------------------
+    # ── Action row ─────────────────────────────────────────────────────
 
     def _build_action_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.addStretch()
+        hl = QHBoxLayout()
+        hl.addStretch()
 
-        self._btn_start = QPushButton("▶  Start Conversion")
-        self._btn_start.setObjectName("btn_start")
+        self._btn_start = QPushButton("▶  Start", objectName="start")
         self._btn_start.setFixedHeight(42)
-        self._btn_start.clicked.connect(self._start_conversion)
-        row.addWidget(self._btn_start)
+        self._btn_start.clicked.connect(self._start)
+        hl.addWidget(self._btn_start)
 
-        row.addSpacing(10)
+        hl.addSpacing(10)
 
-        self._btn_cancel = QPushButton("✖  Cancel")
-        self._btn_cancel.setObjectName("btn_cancel")
+        self._btn_cancel = QPushButton("✖  Cancel", objectName="cancel")
         self._btn_cancel.setFixedHeight(42)
         self._btn_cancel.setEnabled(False)
-        self._btn_cancel.clicked.connect(self._cancel_conversion)
-        row.addWidget(self._btn_cancel)
+        self._btn_cancel.clicked.connect(self._cancel)
+        hl.addWidget(self._btn_cancel)
 
-        row.addStretch()
-        return row
+        hl.addStretch()
+        return hl
 
-    # ------------------------------------------------------------------
-    # Post-init
-    # ------------------------------------------------------------------
+    def _hline(self) -> QFrame:
+        f = QFrame(objectName="sep")
+        f.setFrameShape(QFrame.Shape.HLine)
+        return f
+
+    # ── Post-init ──────────────────────────────────────────────────────
 
     def _post_init(self) -> None:
-        detected = get_ffmpeg_path()
-        self._ffmpeg_edit.setText(detected)
-        if detected != "ffmpeg":
-            self._log(f"Auto-detected FFmpeg: {detected}", "success")
-        else:
-            self._log("ffmpeg.exe not found in project root — using system PATH.", "warning")
-        self._log("DAV Consolidator ready.  Select an input folder to begin.", "success")
-        self._log(
-            f"Segment duration: {SEGMENT_DURATION_SEC}s per file  |  "
-            "Files sorted in natural chronological order.",
-            "info",
-        )
+        self._emit("DAV Consolidator v4.0 ready.", "success")
+        self._emit("Drop .dav files or folders into the Source Files panel.", "info")
+        self._emit("FFmpeg binary loaded from internal bundle (not system PATH).", "info")
 
-    # ------------------------------------------------------------------
-    # Theme
-    # ------------------------------------------------------------------
+        # Async GPU probe after UI is shown
+        QTimer.singleShot(400, self._probe_gpu)
+
+    def _probe_gpu(self) -> None:
+        self._gpu_badge.setText("⚡ detecting…")
+        QApplication.processEvents()
+        gpu_list = detect_all(get_ffmpeg())
+        self._gpu_info = gpu_list
+        detected = [g for g in gpu_list if g.detected]
+        if detected:
+            names = ", ".join(g.label for g in detected)
+            self._gpu_badge.setText(f"⚡ {names} ✓")
+            self._gpu_badge.setStyleSheet("color:#a6e3a1;font-weight:bold;font-size:11px;")
+            for g in detected:
+                self._emit(f"GPU detected: {g.label} ({g.encoder})", "success")
+        else:
+            self._gpu_badge.setText("⚡ CPU only")
+            self._gpu_badge.setStyleSheet("color:#6c7086;font-size:11px;")
+            self._emit("No hardware GPU encoder detected — CPU (libx264) will be used.", "warning")
+
+    # ── Theme ──────────────────────────────────────────────────────────
 
     def _apply_theme(self) -> None:
-        t = _DARK if self._dark_mode else _LIGHT
-        self.setStyleSheet(_build_stylesheet(t))
-        self._log_colours = _LOG_COLOURS_DARK if self._dark_mode else _LOG_COLOURS_LIGHT
+        t = _D if self._dark else _L
+        self.setStyleSheet(_ss(t))
+        self._log_col = _LOG_D if self._dark else _LOG_L
         if hasattr(self, "_btn_theme"):
-            self._btn_theme.setText("☀" if self._dark_mode else "🌙")
+            self._btn_theme.setText("☀" if self._dark else "🌙")
+        if hasattr(self, "_toggle"):
+            self._toggle.set_colors(t["tog_on"], t["tog_off"], t["tog_knob"])
 
     def _toggle_theme(self) -> None:
-        self._dark_mode = not self._dark_mode
+        self._dark = not self._dark
         self._apply_theme()
 
-    # ------------------------------------------------------------------
-    # GPU badge
-    # ------------------------------------------------------------------
+    # ── File management ────────────────────────────────────────────────
 
-    def _on_gpu_toggled(self, checked: bool) -> None:
-        if checked:
-            self._gpu_badge.setObjectName("badge_gpu_no")
-            self._gpu_badge.setText("⚡ GPU: testing…")
-            self._apply_theme()
-            QApplication.processEvents()
-            proc = FFmpegProcessor(ffmpeg_path=self._ffmpeg_edit.text().strip() or get_ffmpeg_path())
-            if proc.detect_nvenc():
-                self._gpu_badge.setObjectName("badge_gpu_ok")
-                self._gpu_badge.setText("⚡ GPU: NVENC ✓")
-            else:
-                self._gpu_badge.setObjectName("badge_gpu_no")
-                self._gpu_badge.setText("⚡ GPU: not found")
-            self._apply_theme()
-        else:
-            self._gpu_badge.setObjectName("badge_gpu_no")
-            self._gpu_badge.setText("⚡ GPU: off")
-            self._apply_theme()
+    def _add_files(self, paths: list[Path]) -> None:
+        existing = {p for p in self._clips}
+        new = [p for p in paths if p not in existing]
+        self._clips.extend(new)
+        self._clips = natural_sorted(self._clips)
+        self._refresh_list()
 
-    # ------------------------------------------------------------------
-    # Browse slots
-    # ------------------------------------------------------------------
-
-    def _browse_folder(self, edit: DropLineEdit) -> None:
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select DAV Input Folder", edit.text() or ""
+    def _browse_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select DAV files", "",
+            "Video files (*.dav *.DAV *.mp4 *.avi *.mkv);;All files (*)",
         )
-        if folder:
-            edit.setText(folder)
+        if paths:
+            self._add_files([Path(p) for p in paths])
 
-    def _browse_file(self, edit: DropLineEdit) -> None:
+    def _browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select folder")
+        if folder:
+            p = Path(folder)
+            files = list(p.rglob("*.dav")) + list(p.rglob("*.DAV"))
+            if files:
+                self._add_files(natural_sorted(files))
+            else:
+                self._warn("No .dav files found in the selected folder.")
+
+    def _clear_files(self) -> None:
+        self._clips.clear()
+        self._refresh_list()
+
+    def _remove_selected(self) -> None:
+        selected_rows = {self._file_list.row(item)
+                         for item in self._file_list.selectedItems()}
+        self._clips = [p for i, p in enumerate(self._clips)
+                       if i not in selected_rows]
+        self._refresh_list()
+
+    def _refresh_list(self) -> None:
+        self._file_list.clear()
+        for p in self._clips:
+            self._file_list.addItem(QListWidgetItem(p.name))
+        n   = len(self._clips)
+        dur = timedelta(seconds=n * SEGMENT_DURATION)
+        self._file_count.setText(
+            f"{n} file(s)  →  {dur} expected"
+            if n else "No files loaded."
+        )
+        # Auto-set output filename from first/last clip
+        if n and not self._output_edit.text().strip():
+            self._auto_output()
+
+    def _auto_output(self) -> None:
+        """Derive output name from DAV naming convention if possible."""
+        if not self._clips:
+            return
+        import re as _re
+        pat = _re.compile(r"^(\d{2}\.\d{2}\.\d{2})-(\d{2}\.\d{2}\.\d{2})")
+        m0 = pat.match(self._clips[0].stem)
+        m1 = pat.match(self._clips[-1].stem)
+        if m0 and m1:
+            name = f"{m0.group(1)}-{m1.group(2)}.mp4"
+        else:
+            name = "output.mp4"
+        out = self._clips[0].parent / name
+        self._output_edit.setText(str(out))
+        self._emit(f"Auto output: {name}", "info")
+
+    # ── Engine toggle ──────────────────────────────────────────────────
+
+    def _on_toggle(self, on: bool) -> None:
+        self._fps_row_widget.setVisible(on)
+        if on:
+            self._mode_desc.setText(
+                "ON — full decode → filter → encode pipeline. "
+                "Normalizes FPS, rebuilds timestamps. Uses GPU if available."
+            )
+        else:
+            self._mode_desc.setText(
+                "OFF — raw bitstream copy, zero decode/encode, "
+                "mathematically exact duration."
+            )
+
+    # ── Browse output ──────────────────────────────────────────────────
+
+    def _browse_output(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Output MP4 As", edit.text() or "",
+            self, "Save output as", self._output_edit.text() or "",
             "MP4 Video (*.mp4);;All Files (*)",
         )
         if path:
-            edit.setText(path)
+            self._output_edit.setText(path)
 
-    def _browse_ffmpeg(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Locate FFmpeg Executable", "",
-            "Executables (*.exe);;All Files (*)",
-        )
-        if path:
-            self._ffmpeg_edit.setText(path)
+    # ── Start / Cancel ────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # File info refresh + auto output filename
-    # ------------------------------------------------------------------
-
-    @pyqtSlot(str)
-    def _refresh_file_info(self, folder: str) -> None:
-        if not folder:
-            self._file_info_label.setText("No folder selected.")
-            self._plan_label.setText("")
+    def _start(self) -> None:
+        if not self._clips:
+            self._warn("Add at least one source file.")
             return
-        try:
-            files = find_dav_files(folder)
-        except NotADirectoryError:
-            self._file_info_label.setText("Invalid folder path.")
-            self._plan_label.setText("")
+        output = self._output_edit.text().strip()
+        if not output:
+            self._warn("Select an output file path.")
             return
 
-        n = len(files)
-        if n > 0:
-            total_s  = SEGMENT_DURATION_SEC * n
-            total_td = timedelta(seconds=total_s)
-            self._file_info_label.setText(
-                f"✓  Found {n} .dav file(s)  →  "
-                f"Expected output: {total_td} ({total_s}s exactly)"
-            )
-            # Auto-fill output filename if user hasn't typed one
-            if not self._output_edit.text().strip():
-                auto = build_output_filename(files, Path(folder))
-                self._output_edit.setText(str(auto))
-                self._log(f"Auto output filename: {auto.name}", "info")
-        else:
-            self._file_info_label.setText("⚠  No .dav files found in this folder.")
-
-        self._plan_label.setText("")
-
-    # ------------------------------------------------------------------
-    # Conversion control
-    # ------------------------------------------------------------------
-
-    def _start_conversion(self) -> None:
-        input_folder = self._input_edit.text().strip()
-        output_file  = self._output_edit.text().strip()
-        ffmpeg_path  = self._ffmpeg_edit.text().strip() or get_ffmpeg_path()
-        ffprobe_path = derive_ffprobe_from_ffmpeg(ffmpeg_path)
-        use_gpu      = self._gpu_check.isChecked()
-
-        if not input_folder:
-            self._warn("Please select an input folder.")
-            return
-        if not output_file:
-            self._warn("Please specify an output file path.")
-            return
-        if not Path(input_folder).is_dir():
-            self._warn(f"Input folder does not exist:\n{input_folder}")
-            return
+        reencode   = self._toggle.checked
+        target_fps = self._fps_spin.value()
 
         self._set_running(True)
-        self._log_view.clear()
-        self._plan_label.setText("")
+        self._log.clear()
         self._progress.setValue(0)
-        self._stage_label.setText("Starting…")
-        self._elapsed_label.setText("")
-        self._run_start = time.monotonic()
-        self._elapsed_timer.start()
+        self._stage_lbl.setText("Starting…")
+        self._elapsed_lbl.setText("")
+        self._t0 = time.monotonic()
+        self._elapsed_t.start()
 
-        self._worker = ConversionWorker(
-            input_folder=input_folder,
-            output_file=output_file,
-            ffmpeg_path=ffmpeg_path,
-            ffprobe_path=ffprobe_path,
-            use_gpu=use_gpu,
+        self._worker = Worker(
+            clips=list(self._clips),
+            output=Path(output),
+            reencode=reencode,
+            target_fps=target_fps,
         )
-        self._worker.log_message.connect(self._on_log_message)
-        self._worker.progress_updated.connect(self._on_progress)
-        self._worker.stage_changed.connect(self._stage_label.setText)
-        self._worker.plan_determined.connect(self._plan_label.setText)
+        self._worker.log_msg.connect(self._on_log)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.stage.connect(self._stage_lbl.setText)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
-        logger.info("ConversionWorker started — input=%s  gpu=%s", input_folder, use_gpu)
 
-    def _cancel_conversion(self) -> None:
+    def _cancel(self) -> None:
         if self._worker and self._worker.isRunning():
-            self._log("Cancellation requested — waiting for FFmpeg to stop…", "warning")
+            self._emit("Cancelling…", "warning")
             self._worker.cancel()
             self._btn_cancel.setEnabled(False)
 
-    # ------------------------------------------------------------------
-    # Worker signal handlers
-    # ------------------------------------------------------------------
+    # ── Worker slots ───────────────────────────────────────────────────
 
     @pyqtSlot(str, str)
-    def _on_log_message(self, message: str, level: str) -> None:
-        self._log(message, level)
+    def _on_log(self, msg: str, lv: str) -> None:
+        self._emit(msg, lv)
 
     @pyqtSlot(int, int)
-    def _on_progress(self, current: int, total: int) -> None:
+    def _on_progress(self, done: int, total: int) -> None:
         if total <= 0:
             return
         self._progress.setMaximum(total)
-        self._progress.setValue(current)
-        pct = int(current / total * 100)
-        self._progress.setFormat(f"{pct}%  ({current} / {total})")
+        self._progress.setValue(done)
+        self._progress.setFormat(f"{int(done/total*100)}%  ({done} / {total})")
 
     @pyqtSlot(bool, str)
-    def _on_finished(self, success: bool, message: str) -> None:
-        self._elapsed_timer.stop()
+    def _on_finished(self, ok: bool, msg: str) -> None:
+        self._elapsed_t.stop()
         self._set_running(False)
-        if success:
+        if ok:
             self._progress.setValue(self._progress.maximum())
             QMessageBox.information(
-                self,
-                "Conversion Complete ✓",
-                f"Output saved to:\n{message}\n\n"
-                f"Verify duration:\n"
-                f'ffprobe -v error -show_entries format=duration '
-                f'-of default=noprint_wrappers=1 "{message}"',
+                self, "Complete ✓",
+                f"Output saved:\n{msg}\n\n"
+                f"Verify:\nffprobe -v error -show_entries format=duration "
+                f"-of default=noprint_wrappers=1 \"{msg}\"",
             )
-        elif message:
-            QMessageBox.critical(self, "Conversion Failed", message)
+        elif msg:
+            QMessageBox.critical(self, "Failed", msg)
 
-    # ------------------------------------------------------------------
-    # Elapsed timer
-    # ------------------------------------------------------------------
+    # ── Elapsed timer ──────────────────────────────────────────────────
 
-    def _tick_elapsed(self) -> None:
-        if self._run_start > 0:
-            elapsed = int(time.monotonic() - self._run_start)
-            self._elapsed_label.setText(f"Elapsed: {timedelta(seconds=elapsed)}")
+    def _tick(self) -> None:
+        if self._t0:
+            self._elapsed_lbl.setText(
+                f"Elapsed: {timedelta(seconds=int(time.monotonic()-self._t0))}"
+            )
 
-    # ------------------------------------------------------------------
-    # Log helper
-    # ------------------------------------------------------------------
+    # ── Log helper ─────────────────────────────────────────────────────
 
-    def _log(self, message: str, level: str = "info") -> None:
-        colour = self._log_colours.get(level, self._log_colours["info"])
+    def _emit(self, msg: str, lv: str = "info") -> None:
+        colour = self._log_col.get(lv, self._log_col["info"])
         fmt    = QTextCharFormat()
         fmt.setForeground(QColor(colour))
-        if level == "header":
+        if lv == "header":
             fmt.setFontWeight(700)
+        cur = self._log.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.insertText(msg + "\n", fmt)
+        self._log.setTextCursor(cur)
+        self._log.ensureCursorVisible()
 
-        cursor = self._log_view.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(message + "\n", fmt)
-        self._log_view.setTextCursor(cursor)
-        self._log_view.ensureCursorVisible()
-
-    # ------------------------------------------------------------------
-    # UI state helpers
-    # ------------------------------------------------------------------
+    # ── UI state ───────────────────────────────────────────────────────
 
     def _set_running(self, running: bool) -> None:
         self._btn_start.setEnabled(not running)
         self._btn_cancel.setEnabled(running)
-        self._input_edit.setEnabled(not running)
+        self._toggle.setEnabled(not running)
+        self._fps_spin.setEnabled(not running)
         self._output_edit.setEnabled(not running)
-        self._ffmpeg_edit.setEnabled(not running)
-        self._gpu_check.setEnabled(not running)
+        self._file_list.setEnabled(not running)
 
     @staticmethod
-    def _warn(message: str) -> None:
-        box = QMessageBox()
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Input Required")
-        box.setText(message)
-        box.exec()
+    def _warn(msg: str) -> None:
+        b = QMessageBox()
+        b.setIcon(QMessageBox.Icon.Warning)
+        b.setWindowTitle("Input Required")
+        b.setText(msg)
+        b.exec()
 
-    # ------------------------------------------------------------------
-    # Close guard
-    # ------------------------------------------------------------------
+    # ── Close guard ────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:   # type: ignore[override]
         if self._worker and self._worker.isRunning():
-            reply = QMessageBox.question(
-                self,
-                "Conversion Running",
-                "A conversion is in progress.\nCancel and exit?",
+            r = QMessageBox.question(
+                self, "Running",
+                "A job is running. Cancel and exit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.StandardButton.Yes:
-                self._elapsed_timer.stop()
+            if r == QMessageBox.StandardButton.Yes:
+                self._elapsed_t.stop()
                 self._worker.cancel()
-                self._worker.wait(5_000)
+                self._worker.wait(5000)
                 event.accept()
             else:
                 event.ignore()

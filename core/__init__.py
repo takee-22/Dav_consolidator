@@ -1,1 +1,1 @@
-"""core – FFmpeg processing pipeline."""
+"""core — Processing pipeline and GPU detection."""

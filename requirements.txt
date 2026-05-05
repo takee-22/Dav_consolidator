@@ -1,5 +1,2 @@
-# DAV Consolidator v3 — Python dependencies
-# Install with:  pip install -r requirements.txt
-
 PyQt6>=6.6.0
 pyinstaller>=6.0.0

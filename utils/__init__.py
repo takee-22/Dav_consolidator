@@ -1,1 +1,1 @@
-"""utils – Binary resolution, file discovery, path helpers."""
+"""utils — Internal helpers. No user-facing configuration."""
